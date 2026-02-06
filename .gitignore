@@ -1,0 +1,96 @@
+# Build directories
+/build/
+/build-*/
+/out/
+/bin/
+/lib/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+compile_commands.json
+
+# Object files
+*.o
+*.obj
+*.lo
+*.la
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Libraries
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Debug symbols
+*.dSYM/
+*.pdb
+
+# Profiling
+gmon.out
+perf.data*
+callgrind.out.*
+
+# Core dumps
+core
+core.*
+
+# Sanitizer logs
+asan.log.*
+ubsan.log.*
+
+# VS Code
+.vscode/
+
+# CLion
+.idea/
+cmake-build-*/
+
+# Vim
+*.swp
+*.swo
+*.swn
+
+# Emacs
+*~
+\#*\#
+
+# Linux
+*.tmp
+*.bak
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Conan
+conanbuildinfo.*
+conan.lock
+
+# vcpkg
+vcpkg_installed/
+
+# Logs
+*.log
+
+# Runtime-generated files
+*.pid
+*.sock
+
+# Keep empty dirs
+!.gitkeep
