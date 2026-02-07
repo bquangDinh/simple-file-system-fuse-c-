@@ -90,18 +90,34 @@ std::shared_mutex& get_lock_for_inode(ino_t ino) {
 }
 
 /* FUSE Helper Funcs */
+uid_t get_context_uid() {
+	fuse_context* ctx = fuse_get_context();
+
+	assert(ctx != nullptr);
+
+	return ctx->uid;
+}
+
+gid_t get_context_gid() {
+	fuse_context* ctx = fuse_get_context();
+
+	assert(ctx != nullptr);
+
+	return ctx->gid;
+}
+
+bool is_context_user_root() {
+	return get_context_uid() == 0;
+}
+
 error_t make_file(const char* path, mode_t mode, Inode* out) {
 	assert(path != nullptr);
 	assert(out != nullptr);
 
 	DBG("path: %s | mode: %05o", path, mode & 0x7777);
 
-	fuse_context* ctx = fuse_get_context();
-
-	assert(ctx != nullptr);
-
-	uid_t uid = ctx->uid;
-	gid_t gid = ctx->gid;
+	uid_t uid = get_context_uid();
+	gid_t gid = get_context_gid();
 
 	Utilities::path_split ps = { 0 };
 
@@ -136,10 +152,10 @@ error_t make_file(const char* path, mode_t mode, Inode* out) {
 
 	err = dirent_manager.dir_find(parent_inode.get_ino(), base, nullptr);
 
-	if (err == DIR_FIND_FOUND_ITEM || err < 0) {
+	if (err <= 0) {
 		Utilities::free_path_split(&ps);
 
-		if (err == DIR_FIND_FOUND_ITEM) return -EEXIST;
+		if (err == 0) return -EEXIST;
 
 		return err;
 	}
@@ -569,13 +585,6 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 
 	if (!dir_inode->is_valid()) return -ENOENT;
 
-	fuse_context* ctx = fuse_get_context();
-
-	assert(ctx != nullptr);
-
-	uid_t uid = ctx->uid;
-	gid_t gid = ctx->gid;
-
 	// Check permissions to open dir
 	int access_mode = ACCMODE_FROM_FLAG(fi->flags);
 	int need_read = ACCMODE_REQUEST_READ(access_mode);
@@ -684,12 +693,8 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 static int myfs_mkdir(const char* path, mode_t mode) {
 	DBG("path: %s | mode: %05o", path, mode & 07777);
 
-	fuse_context* ctx = fuse_get_context();
-
-	assert(ctx != nullptr);
-
-	uid_t uid = ctx->uid;
-	gid_t gid = ctx->gid;
+	uid_t uid = get_context_uid();
+	gid_t gid = get_context_gid();
 
 	Utilities::path_split ps = { 0 };
 
@@ -724,10 +729,10 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	// Check if the target directory already exists
 	err = dirent_manager.dir_find(parent_inode.get_ino(), base, nullptr);
 
-	if (err == DIR_FIND_FOUND_ITEM || err < 0) {
+	if (err <= 0) {
 		Utilities::free_path_split(&ps);
 
-		if (err == DIR_FIND_FOUND_ITEM) return -EEXIST;	
+		if (err == 0) return -EEXIST;	
 
 		return err;
 	}
@@ -1022,14 +1027,466 @@ static int myfs_fsync(const char* path, int datasync, struct fuse_file_info* fi)
 }
 
 static int myfs_rename(const char* source_path, const char* target_path, unsigned int flag) {
+	DBG("source: %s | target: %s | flags = %u", source_path, target_path, flag);
+
+	Utilities::path_split source_ps = { 0 };
+	Utilities::path_split target_ps = { 0 };
+
+	if (Utilities::split_path(source_path, &source_ps) < 0) return -ENOMEM;
+	if (Utilities::split_path(target_path, &target_ps) < 0) {
+		Utilities::free_path_split(&source_ps);
+
+		return -ENOMEM;
+	}
+
+	char* source_dir = source_ps.dir;
+	char* source_base = source_ps.base;
+
+	char* target_dir = target_ps.dir;
+	char* target_base = target_ps.base;
+
+	if (IS_STR_EMPTY(source_base) || IS_STR_EMPTY(target_base)) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+
+		return -EINVAL;
+	}
+
+	// If mv refers the same source and target within the same directory, then we do nothing
+	if (strcmp(source_dir, target_dir) == 0 && strcmp(source_base, target_base) == 0) return 0;
+
+	// Look up parents of both source and target
+	Inode source_parent_inode, target_parent_inode, source_inode, target_inode;
+
+	dirent_t source_entry = { 0 }, target_entry = { 0 };
+
+	error_t err = inode_manager.get_inode_from_path(source_dir, ROOT_INO, source_parent_inode);
+
+	if (err < 0) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+
+		return err;
+	}
+
+	// Obtain write lock on working inodes
+	WR_LOCK(get_lock_for_inode(source_parent_inode.get_ino()));
+
+	// Check if source parent is a valid directory
+	if (!source_parent_inode.is_dir() || !source_parent_inode.is_valid()) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+		
+		return -ENOTDIR;
+	}
+
+	err = inode_manager.get_inode_from_path(target_dir, ROOT_INO, target_parent_inode);
+
+	if (err < 0) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+
+		return err;
+	}
+
+	// In case of two parents are the same (mv within the same directory)
+	// Having another lock on target directory will introduce deadlock
+	// So, only lock when two parent inodes are different
+	if (target_parent_inode.get_ino() != source_parent_inode.get_ino()) {
+		WR_LOCK(get_lock_for_inode(target_parent_inode.get_ino()));
+	}
+
+	// Check if the target parent is a valid directory
+	if (!target_parent_inode.is_dir() || !target_parent_inode.is_valid()) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+
+		return -ENOTDIR;
+	}
+
+	// Check permissions
+	// Since we want to write into source parent inode, thus we need write and execute permissions
+	if (!source_parent_inode.can_execute() || !source_parent_inode.can_write()) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+
+		return -EACCES;
+	}
+
+	// Check the same thing on target parent inode
+	if (!target_parent_inode.can_execute() || !target_parent_inode.can_write()) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+
+		return -EACCES;	
+	}
+
+	// Find source entry
+	err = dirent_manager.dir_find(source_parent_inode.get_ino(), source_base, &source_entry);
+
+	if (err < 0) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+
+		return err;
+	} 
+
+	// Obtain source inode
+	err = inode_manager.get_inode(source_entry.ino, source_inode);
+
+	if (err < 0) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+
+		return err;
+	}
+
+	// Acquire write lock on source inode
+	WR_LOCK(get_lock_for_inode(source_inode.get_ino()));
+
+	if (source_parent_inode.is_dir_sticky()) {
+		if (
+			!is_context_user_root() &&							// user is not the root user
+			!source_parent_inode.user_is_owner() &&		// user does not own the source directory
+			!source_inode.user_is_owner()				// user does not own the source item
+		) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return -EPERM;
+		}
+	}
+
+	// Lookup destination
+	bool target_already_exist = false;
+
+	err = dirent_manager.dir_find(target_parent_inode.get_ino(), target_base, &target_entry);
+
+	if (err < 0) {
+		if (err != -ENOENT) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return err;
+		}
+
+		target_already_exist = false;
+	} else {
+		target_already_exist = true;
+	}
+
+	if (target_already_exist) {
+		assert(target_entry.ino != 0);
+
+		// Obtain lock on target
+		// Since it could be possible that source inode and target inode are the same
+		// maybe target inode is a hard link to source inode
+		// obtain the same lock twice will possibly introduce deadlock
+		if (target_entry.ino != source_inode.get_ino()) {
+			WR_LOCK(get_lock_for_inode(target_entry.ino));
+		}
+
+		err = inode_manager.get_inode(target_entry.ino, target_inode);
+
+		if (err < 0) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return err;
+		}
+
+		// Check for sticky behavior on the target directory
+		if (target_parent_inode.is_dir_sticky()) {
+			if (
+				!is_context_user_root() &&							// user is not the root user
+				!target_parent_inode.user_is_owner() &&		// user does not own the target directory
+				!target_inode.user_is_owner()				// user does not own the target item
+			) {
+				Utilities::free_path_split(&source_ps);
+				Utilities::free_path_split(&target_ps);
+
+				return -EPERM;
+			}
+		}
+
+		// Check for compatibility
+		// you can't rename a file into a directory or vice versa
+		if (source_inode.is_dir() && !target_inode.is_dir()) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return -ENOTDIR;
+		}
+
+		if (!source_inode.is_dir() && target_inode.is_dir()) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return -EISDIR;
+		}
+
+		// Since if we want to replace a directory, the target directory must be empty
+		if (target_inode.is_dir() && !target_inode.is_dir_empty()) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return -ENOTEMPTY;
+		}
+	}
+
+	// For source entry
+	// If source entry is a directory, we can't move the source entry (a dir) into its own subtree
+	if (source_inode.is_dir()) {
+		// Ex: c has structure like this
+		// c:
+		// 	--> b
+		//	--> d/e
+		// we can't do "rename c -> c/d/e/<new_c>"
+		if (source_parent_inode.get_ino() != target_parent_inode.get_ino()) {
+			if (dirent_manager.is_descendant(target_parent_inode, source_inode)) {
+				Utilities::free_path_split(&source_ps);
+				Utilities::free_path_split(&target_ps);
+
+				return -EINVAL;
+			}
+		}
+	}
+
+	// If rename cross-directory, user must own the source directory (in case of directory)
+	if (source_inode.is_dir() && source_parent_inode.get_ino() != target_parent_inode.get_ino()) {
+		if (
+			!is_context_user_root() &&					// user is not the root user
+			!source_inode.user_is_owner()				// user does not own the source item
+		) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return -EACCES;
+		}
+	}
+
+	// All checks are good, perform rename
+	if (target_already_exist) {
+		assert(target_inode.get_ino() != 0);
+
+		// Rename target entry from target directory
+		err = dirent_manager.dir_remove(target_parent_inode, target_base);
+
+		if (err < 0) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return err;
+		}
+
+		// Update nlink of target inode
+		target_inode.inode.nlink--;
+
+		err = target_inode.save();
+
+		if (err < 0) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return err;
+		}
+
+		if (target_inode.should_file_be_deleted()) {
+			// Remove inode
+			err = target_inode.release();
+
+			if (err < 0) {
+				Utilities::free_path_split(&source_ps);
+				Utilities::free_path_split(&target_ps);
+
+				return err;
+			}
+		}
+	}
+
+	// Remove source entry from source parent
+	err = dirent_manager.dir_remove(source_parent_inode, source_base);
+
+	if (err < 0) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);	
+
+		return err;
+	}
+
+	// Add new entry into target parent
+	err = dirent_manager.dir_add(target_parent_inode, source_inode.get_ino(), target_base);
+
+	if (err < 0) {
+		Utilities::free_path_split(&source_ps);
+		Utilities::free_path_split(&target_ps);
+
+		return err;
+	}
+
+	// If cross-directory rename
+	// then update ".." to point to target dir
+	if (source_inode.is_dir() && source_parent_inode.get_ino() != target_parent_inode.get_ino()) {
+		err = dirent_manager.dir_update_dotdot(source_inode, target_parent_inode);
+
+		if (err < 0) {
+			Utilities::free_path_split(&source_ps);
+			Utilities::free_path_split(&target_ps);
+
+			return err;
+		}
+	}
+	
+	Utilities::free_path_split(&source_ps);
+	Utilities::free_path_split(&target_ps);
+
 	return 0;
 }
 
 static int myfs_rmdir(const char* path) {
+	if (strcmp(path, "/") == 0) {
+		// Cannot remove root directory
+		return -EBUSY;
+	}
+
+	Utilities::path_split ps = { 0 };
+
+	if (Utilities::split_path(path, &ps) < 0) return -ENOMEM;
+
+	char *base = ps.base;
+	char *dir = ps.dir;
+
+	if (IS_STR_EMPTY(base)) {
+		Utilities::free_path_split(&ps);
+
+		return -EINVAL;
+	}
+
+	Inode dir_inode, parent_inode;
+
+	error_t err = inode_manager.get_inode_from_path(path, ROOT_INO, dir_inode);
+
+	if (err < 0) {
+		Utilities::free_path_split(&ps);
+
+		return err;
+	}
+
+	// Acquire write lock on dir inode
+	WR_LOCK(get_lock_for_inode(dir_inode.get_ino()));
+
+	// Check if this is a directory
+	if (!dir_inode.is_dir()) {
+		Utilities::free_path_split(&ps);
+
+		return -ENOTDIR;
+	}
+
+	// Check if the directory is empty
+	// Can only remove an empty directory
+	if (!dir_inode.is_dir_empty()) {
+		Utilities::free_path_split(&ps);
+
+		return -ENOTEMPTY;
+	}
+
+	err = inode_manager.get_inode_from_path(dir, ROOT_INO, parent_inode);
+
+	if (err < 0) {
+		Utilities::free_path_split(&ps);
+
+		return err;
+	}
+
+	// Acquire write lock on parent
+	WR_LOCK(get_lock_for_inode(parent_inode.get_ino()));
+
+	// Check if user has permission on parent dir to remove (write permission)
+	if (!parent_inode.can_write()) {
+		Utilities::free_path_split(&ps);
+
+		return -EACCES;
+	}
+
+	// For sticky behavior on parent dir
+	// Only owner of the entry being deleted or owner of the parent dir or root can perform rmdir
+	if (parent_inode.is_dir_sticky()) {
+		if (
+			!is_context_user_root() &&				// user is not the root user
+			!parent_inode.user_is_owner() &&		// user does not own the parent directory
+			!dir_inode.user_is_owner()				// user does not own the item being removed
+		) {
+			Utilities::free_path_split(&ps);
+
+			return -EPERM;
+		}
+	}
+
+	// Remove dir entry from parent
+	error_t err = dirent_manager.dir_remove(parent_inode, base);
+
+	if (err < 0) {
+		Utilities::free_path_split(&ps);
+
+		return err;
+	}
+
+	Utilities::free_path_split(&ps);
+
+	// Update parent nlink
+	assert(parent_inode.inode.nlink > 0);
+
+	parent_inode.inode.nlink--;
+
+	err = parent_inode.save();
+
+	if (err < 0) {
+		return err;
+	}
+
+	// release dir inode back to the system
+	err = dir_inode.release();
+
+	if (err < 0) {
+		return err;
+	}
+
 	return 0;
 }
 
 static int myfs_releasedir(const char* path, struct fuse_file_info *fi) {
+	// Check if inode is cached with opendir()
+	if (fi->fh == 0) {
+		perror("opendir is not called prior to this function call");
+
+		return -EPERM;
+	}
+
+	file_handler* fh = (file_handler*)fi->fh;
+
+	assert(fh != nullptr);
+
+	Inode* dir_inode = fh->inode;
+
+	// Acquire write lock on dir inode
+	WR_LOCK(get_lock_for_inode(dir_inode->get_ino()));
+
+	assert(dir_inode->inode.open_count > 0);
+
+	dir_inode->inode.open_count--;
+
+	error_t err = dir_inode->save();
+	
+	delete fh->inode;
+
+	free((void*)fi->fh);
+
+	fi->fh = 0;
+
+	if (err < 0) {
+		return err;
+	}
+
 	return 0;
 }
 

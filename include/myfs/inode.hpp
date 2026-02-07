@@ -40,6 +40,9 @@ struct inode_t {
 };
 
 class Inode {
+private:
+    uid_t context_uid;
+    gid_t context_gid;
 public:
     inode_t inode;
 
@@ -71,6 +74,16 @@ public:
     bool can_execute();
 
     bool is_dir();
+    
+    bool is_dir_sticky();
+
+    bool is_dir_empty();
+
+    bool should_file_be_deleted();
+
+    bool user_is_owner();
+
+    bool user_is_group();
 
     ino_t get_ino() const;
 

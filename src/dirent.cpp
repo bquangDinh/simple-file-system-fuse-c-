@@ -55,7 +55,7 @@ error_t DirentManager::dir_find(ino_t ino, const char* fname, dirent_t* out) {
 
                     free(buffer);
 
-                    return DIR_FIND_FOUND_ITEM;
+                    return 0;
                 }
             }
         }
@@ -63,7 +63,7 @@ error_t DirentManager::dir_find(ino_t ino, const char* fname, dirent_t* out) {
 
     free(buffer);
 
-    return DIR_FIND_NOT_FOUND_ITEM;
+    return -ENOENT;
 }
 
 error_t DirentManager::dir_add(Inode& parent, const Inode& child, const char* fname) {
@@ -165,7 +165,7 @@ error_t DirentManager::dir_add(Inode& parent, ino_t child_ino, const char* fname
 
     blk_t data_block_idx;
 
-    err = datablock_manager.get_available_blk(&data_block_idx);
+    err = datablock_manager.get_available_blk(data_block_idx);
 
     if (err < 0) {
         free(buffer);
@@ -306,6 +306,44 @@ int DirentManager::dir_entries_count(Inode& dir) {
     return count;
 }
 
+int DirentManager::dir_entries_count(inode_t dir) {
+    StorageManager& storage = StorageManager::instance();
+
+    dirent_t* buffer = (dirent_t*)malloc(storage.BLOCK_SIZE);
+
+    if (buffer == nullptr) return -ENOMEM;
+
+    uint16_t num_entries_per_block = storage.BLOCK_SIZE / sizeof(dirent_t);
+
+    int16_t count = 0;
+    
+    error_t err;
+
+    blk_t blk;
+
+    for (uint16_t i = 0; i < DIRECT_PTRS_COUNT; ++i) {
+        if (dir.directs[i] == 0) continue;
+
+        blk = dir.directs[i];
+        
+        err = storage.block_read(blk, buffer);
+
+        if (err < 0) {
+            free(buffer);
+            
+            return err;
+        }
+
+        for (uint16_t j = 0; j < num_entries_per_block; ++j) {
+            if (buffer[j].valid == 1) count++;
+        }
+    }
+
+    free(buffer);
+
+    return count;
+}
+
 error_t DirentManager::dir_update_dotdot(Inode& dir_inode, Inode& new_parent) {
     StorageManager& storage = StorageManager::instance();
     InodeManager& inode_manager = InodeManager::instance();
@@ -353,9 +391,9 @@ error_t DirentManager::dir_update_dotdot(Inode& dir_inode, Inode& new_parent) {
                     return err;
                 }
 
-                old_parent.inode.nlink--;
+                assert(old_parent.inode.nlink > 0);
 
-                assert(old_parent.inode.nlink >= 0);
+                old_parent.inode.nlink--;
 
                 err = old_parent.save();
 
@@ -385,4 +423,29 @@ error_t DirentManager::dir_update_dotdot(Inode& dir_inode, Inode& new_parent) {
     free(buffer);
 
     return -ENOENT;
+}
+
+bool DirentManager::is_descendant(const Inode& i, const Inode& origin) {
+    return is_descendant(i.inode, origin.inode);
+}
+
+bool DirentManager::is_descendant(const inode_t& i, const inode_t& origin) {
+    // If origin is root folder
+    // then it's always true as every inode has root
+    if (origin.ino == ROOT_INO) return true;
+
+    // Walk '..' entry of i until reached root or origin
+    dirent_t parent = { 0 };
+
+    ino_t current_ino = i.ino;
+
+    do {
+        assert(dir_find(current_ino, "..", &parent) == 0);
+
+        if (parent.ino == origin.ino) return true;
+
+        current_ino = parent.ino;
+    } while (parent.ino != ROOT_INO);
+
+    return false;
 }

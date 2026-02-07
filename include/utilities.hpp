@@ -22,6 +22,8 @@
 
 #define IS_ROOT(uid) (uid == 0)
 
+#define IS_STR_EMPTY(str) (strcmp(str, "") == 0)
+
 typedef unsigned char* bitmap_t;
 
 namespace Utilities {

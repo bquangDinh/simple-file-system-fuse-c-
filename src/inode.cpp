@@ -15,12 +15,26 @@
 /* --------------- Inode class ------------------ */
 Inode::Inode()
 {
+    fuse_context* ctx = fuse_get_context();
+
+    assert(ctx != nullptr);
+
+    context_uid = ctx->uid;
+    context_gid = ctx->gid;
+
     inode = { 0 };
 }
 
 Inode::Inode(ino_t ino, mode_t mode, nlink_t nlink, uid_t uid, gid_t gid)
 {
     assert(ino < SuperblockManager::instance().get_max_inum());
+
+    fuse_context* ctx = fuse_get_context();
+
+    assert(ctx != nullptr);
+
+    context_uid = ctx->uid;
+    context_gid = ctx->gid;
 
     inode.ino = ino;
     inode.valid = 1;
@@ -42,6 +56,13 @@ Inode::Inode(ino_t ino, mode_t mode, nlink_t nlink, uid_t uid, gid_t gid)
 
 Inode::Inode(const Inode& from)
 {
+    fuse_context* ctx = fuse_get_context();
+
+    assert(ctx != nullptr);
+
+    context_uid = ctx->uid;
+    context_gid = ctx->gid;
+
     inode.ino = from.inode.ino;
     inode.valid = from.inode.valid;
     inode.size = from.inode.size;
@@ -93,33 +114,21 @@ ino_t Inode::get_ino() const {
 }
 
 bool Inode::can_write() {
-    fuse_context* ctx = fuse_get_context();
-
-    assert(ctx != nullptr);
-
     mode_t perm = get_perm_based_ctx();
 
-    return PERM_CAN_WRITE(perm) || IS_ROOT(ctx->uid);
+    return PERM_CAN_WRITE(perm) || IS_ROOT(context_uid);
 }
 
 bool Inode::can_read() {
-    fuse_context* ctx = fuse_get_context();
-
-    assert(ctx != nullptr);
-
     mode_t perm = get_perm_based_ctx();
 
-    return PERM_CAN_READ(perm) || IS_ROOT(ctx->uid);
+    return PERM_CAN_READ(perm) || IS_ROOT(context_uid);
 }
 
 bool Inode::can_execute() {
-    fuse_context* ctx = fuse_get_context();
-
-    assert(ctx != nullptr);
-
     mode_t perm = get_perm_based_ctx();
 
-    return PERM_CAN_EXECUTE(perm) || IS_ROOT(ctx->uid);
+    return PERM_CAN_EXECUTE(perm) || IS_ROOT(context_uid);
 }
 
 bool Inode::is_dir() {
@@ -215,17 +224,10 @@ error_t Inode::release() {
 }
 
 mode_t Inode::get_perm_based_ctx() {
-    fuse_context* ctx = fuse_get_context();
-
-    assert(ctx != nullptr);
-
-    uid_t uid = ctx->uid;
-    gid_t gid = ctx->gid;
-
     mode_t perm;
 
-    if (uid == inode.uid) perm = Utilities::PermissionOps::get_user_perm(inode.mode);
-    else if (gid == inode.gid) perm = Utilities::PermissionOps::get_group_perm(inode.mode);
+    if (user_is_owner()) perm = Utilities::PermissionOps::get_user_perm(inode.mode);
+    else if (user_is_group()) perm = Utilities::PermissionOps::get_group_perm(inode.mode);
     else perm = Utilities::PermissionOps::get_other_perm(inode.mode);
 
     return perm;
@@ -255,6 +257,30 @@ error_t Inode::get_indirect_blk_data(int* out) {
 
 bool Inode::is_singly_indirect_allocated() {
     return inode.singly_indirect_ptr > 0;
+}
+
+bool Inode::is_dir_sticky() {
+    return is_dir() && (inode.mode & 01000);
+}
+
+bool Inode::is_dir_empty() {
+    assert(is_dir());
+
+    DirentManager& dirent_manager = DirentManager::instance();
+
+    return dirent_manager.dir_entries_count(inode) <= 2;
+}
+
+bool Inode::should_file_be_deleted() {
+    return !is_dir() && inode.nlink == 0 && inode.open_count == 0;
+}
+
+bool Inode::user_is_owner() {
+    return context_uid == inode.uid;
+}
+
+bool Inode::user_is_group() {
+    return context_gid = inode.gid;
 }
 /* ---------------------------------------------- */
 
@@ -506,15 +532,6 @@ error_t InodeManager::get_inode_from_path(const char* path, ino_t start, Inode& 
     assert(path != nullptr);
     assert(root != nullptr);
     assert(start < superblock.get_max_inum());
-
-    struct fuse_context* ctx = fuse_get_context();
-
-    assert(ctx != nullptr);
-
-    uid_t uid = ctx->uid;
-    gid_t gid = ctx->gid;
-
-    mode_t perm;
 
     Utilities::path_split p = { 0 };
 

@@ -4,9 +4,6 @@
 
 #include "inode.hpp"
 
-#define DIR_FIND_FOUND_ITEM 1
-#define DIR_FIND_NOT_FOUND_ITEM 0
-
 struct dirent_t {
     ino_t ino;
     uint16_t valid;
@@ -42,5 +39,11 @@ public:
 
     int dir_entries_count(Inode& dir);
 
+    int dir_entries_count(inode_t dir);
+
     error_t dir_update_dotdot(Inode& dir_inode, Inode& new_parent);
+
+    bool is_descendant(const Inode& i, const Inode& origin);
+
+    bool is_descendant(const inode_t& i, const inode_t& origin);
 };
