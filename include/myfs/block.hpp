@@ -27,9 +27,9 @@ private:
 
     std::shared_mutex& get_lock_for_blk(blk_t blk_num);
 public:
-    static const int DISK_SIZE = 32 * 1024 * 1024;
-    static const int BLOCK_SIZE = 4096;
-    static const int NUM_BLK = DISK_SIZE / BLOCK_SIZE;
+    static const uint32_t DISK_SIZE = 32 * 1024 * 1024;
+    static const uint32_t BLOCK_SIZE = 4096;
+    static const uint32_t NUM_BLK = DISK_SIZE / BLOCK_SIZE;
 
     static StorageManager& instance () {
         static StorageManager instance;

@@ -241,12 +241,10 @@ void Inode::from(ino_t ino, mode_t mode, nlink_t nlink, uid_t uid, gid_t gid) {
     inode.gid = gid;
 }
 
-error_t Inode::get_indirect_blk_data(int* out) {
+error_t Inode::get_indirect_blk_data(blk_t* out) {
     StorageManager& storage = StorageManager::instance();
 
     assert(inode.singly_indirect_ptr > 0);
-
-    uint16_t num_blks_indirect = storage.BLOCK_SIZE / sizeof(int);
 
     error_t err = storage.block_read(inode.singly_indirect_ptr, out);
 

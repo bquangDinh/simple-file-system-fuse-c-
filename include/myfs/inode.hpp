@@ -87,7 +87,7 @@ public:
 
     ino_t get_ino() const;
 
-    error_t get_indirect_blk_data(int* out);
+    error_t get_indirect_blk_data(blk_t* out);
 
     error_t save();
 

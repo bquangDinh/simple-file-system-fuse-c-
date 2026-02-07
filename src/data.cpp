@@ -88,6 +88,7 @@ error_t DataBlockManager::get_available_blk(blk_t& out) {
                 // Free data block found
                 Utilities::BitmapOps::set_bitmap(bitmap, j - i * num_bits_per_block);
 
+                // Update bitmap
                 err = storage.block_write(offset + i, bitmap);
 
                 if (err < 0) {
@@ -97,6 +98,29 @@ error_t DataBlockManager::get_available_blk(blk_t& out) {
                 }
 
                 free(bitmap);
+
+                // Make sure the newly allocated data block is set to zero
+                // I'm not sure if I should do this as it hurts performance
+                // but leaving garbage data will make ftruncate buggy (as indirect region will read the entire block)
+                // but the index is not guaranteed to be within the approriate bound, thus it will read trunk data
+                // and think there is an allocated data block
+                void* buffer = malloc(storage.BLOCK_SIZE);
+
+                if (buffer == nullptr) {
+                    return -ENOMEM;
+                }
+
+                memset(buffer, 0, storage.BLOCK_SIZE);
+
+                err = storage.block_write(j + superblock.get_data_region_start_blk(), buffer);
+
+                if (err < 0) {
+                    free(buffer);
+
+                    return err;
+                }
+
+                free(buffer);
 
                 // Update superblock stat
                 superblock.decrease_free_data_blk_count();
