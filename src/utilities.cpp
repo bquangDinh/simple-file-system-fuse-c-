@@ -6,6 +6,27 @@
 #include <errno.h>
 #include <cstdlib>
 
+void Utilities::print_hex(const char* str, size_t len) {
+	for (size_t i = 0; i < len; ++i) {
+		printf("%02x", str[i]);
+	}
+
+	printf("\n");
+}
+
+void Utilities::print_bitmap_bits(bitmap_t bitmap, size_t bits) {
+	for (size_t i = 0; i < bits; ++i) {
+		size_t byte = i / 8;
+		size_t bit = i % 8;
+
+		printf("%d", (bitmap[byte] >> bit) & 1);
+
+		if ((i + 1) % 8 == 0) printf(" ");
+	}
+
+	printf("\n");
+}
+
 void Utilities::debug(const char* file, int line, const char* func, const char* fmt, ...) {
     std::printf("[%s:%d:%s] ", file, line, func);
 

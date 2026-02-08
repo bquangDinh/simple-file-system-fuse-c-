@@ -5,11 +5,15 @@
 #include <cstdarg>
 #include <cstdio>
 
+#define DEBUG
+
 #ifdef DEBUG
 #define DBG(fmt, ...) \
     Utilities::debug(__FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define DBG_RAW(...) printf(__VA_ARGS__)
 #else
 #define DBG(fmt, ...) do {} while (0)
+#define DBG_RAW(...) do {} while (0)
 #endif
 
 /**
@@ -32,6 +36,10 @@ namespace Utilities {
         char *dir;
         char *base;
     };
+
+    void print_hex(const char* str, size_t len);
+
+    void print_bitmap_bits(const bitmap_t bitmap, size_t bytes);
 
     void debug(const char* file, int line, const char* func, const char* fmt, ...);
 

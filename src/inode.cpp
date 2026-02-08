@@ -23,6 +23,8 @@ Inode::Inode()
     context_gid = ctx->gid;
 
     inode = { 0 };
+
+    inode.valid = 1;
 }
 
 Inode::Inode(ino_t ino, mode_t mode, nlink_t nlink, uid_t uid, gid_t gid)
@@ -82,17 +84,41 @@ Inode::Inode(const Inode& from)
 }
 
 Inode& Inode::operator=(const Inode& from) {
-    Inode* ino = new Inode(from);
+    if (this == &from) return *this;
+    
+    inode.ino = from.inode.ino;
+    inode.valid = from.inode.valid;
+    inode.size = from.inode.size;
+    inode.mode = from.inode.mode;
+    inode.nlink = from.inode.nlink;
+    inode.open_count = from.inode.open_count;
+    inode.uid = from.inode.uid;
+    inode.gid = from.inode.gid;
+    inode.atime = from.inode.atime;
+    inode.mtime = from.inode.mtime;
+    inode.ctime = from.inode.ctime;
+    memcpy(inode.directs, from.inode.directs, DIRECT_PTRS_COUNT * sizeof(blk_t));
+    inode.singly_indirect_ptr = from.inode.singly_indirect_ptr;
 
-    return *ino;
+    return *this;
 }
 
 Inode& Inode::operator=(const inode_t& from) {
-    Inode* ino = new Inode();
+    inode.ino = from.ino;
+    inode.valid = from.valid;
+    inode.size = from.size;
+    inode.mode = from.mode;
+    inode.nlink = from.nlink;
+    inode.open_count = from.open_count;
+    inode.uid = from.uid;
+    inode.gid = from.gid;
+    inode.atime = from.atime;
+    inode.mtime = from.mtime;
+    inode.ctime = from.ctime;
+    memcpy(inode.directs, from.directs, DIRECT_PTRS_COUNT * sizeof(blk_t));
+    inode.singly_indirect_ptr = from.singly_indirect_ptr;
 
-    ino->inode = from;
-
-    return *ino;
+    return *this;
 }
 
 bool Inode::is_valid() {
@@ -135,14 +161,31 @@ bool Inode::is_dir() {
     return S_ISDIR(inode.mode);
 }
 
+void Inode::print_info() {
+    DBG("ino: %ld", inode.ino);
+    DBG("valid: %u", inode.valid);
+    DBG("size: %u", inode.size);
+    DBG("mode: %o", inode.mode);
+    DBG("nlink: %u", inode.nlink);
+    DBG("open_count: %u", inode.open_count);
+    DBG("uid: %u", inode.uid);
+    DBG("gid: %u", inode.gid);
+    DBG("indirect: %u", inode.singly_indirect_ptr);
+    DBG_RAW("\tdirects: ");
+
+    for (uint16_t i = 0; i < DIRECT_PTRS_COUNT; ++i) DBG_RAW("%u ", inode.directs[i]);
+
+    DBG_RAW("\n");
+}
+
 error_t Inode::save() {
     StorageManager& storage = StorageManager::instance();
     SuperblockManager& superblock = SuperblockManager::instance();
 
     uint32_t inodes_per_block = storage.BLOCK_SIZE / sizeof(inode_t);
-    uint32_t block_index = inode.ino / inodes_per_block;
     uint32_t inode_index = inode.ino % inodes_per_block;
     uint32_t inode_region_start_idx = superblock.get_ino_region_start_blk();
+    uint32_t block_index = inode_region_start_idx + (inode.ino / inodes_per_block);
 
     // Read inode block
     inode_t* buf = (inode_t*)std::malloc(storage.BLOCK_SIZE);
@@ -334,6 +377,10 @@ error_t InodeManager::init_root() {
     // TODO: use set_ino()
     err = get_available_ino(root_ino);
 
+    if (err < 0) {
+        return err;
+    }
+
     assert(root_ino == ROOT_INO);
 
     fuse_context* ctx = fuse_get_context();
@@ -345,11 +392,17 @@ error_t InodeManager::init_root() {
 
     root = new Inode(ROOT_INO, S_IFDIR | 0775, 1, uid, gid);
     
-    root->save();
+    err = root->save();
+
+    if (err < 0) {
+        delete root;
+
+        return err;
+    }
 
     // Add "." entry to root inode
     err = dirent_manager.dir_add(*root, ROOT_INO, ".");
-
+    
     if (err < 0) {
         delete root;
 
@@ -362,13 +415,19 @@ error_t InodeManager::init_root() {
 }
 
 error_t InodeManager::init() {
+    DBG("Initializing inode bitmap...");
+
     error_t err = init_bitmap();
 
     if (err < 0) return err;
 
+    DBG("Done. Initializing root inode...");
+
     err = init_root();
 
     if (err < 0) return err;
+
+    DBG("Done.");
 
     return 0;
 }
@@ -511,11 +570,7 @@ error_t InodeManager::get_inode(ino_t ino, Inode& out) {
         return err;
     }
 
-    inode_t inode = { 0 };
-    
-    memcpy(&inode, buffer + ino_idx, sizeof(inode_t));
-
-    out = inode;
+    out = buffer[ino_idx];
 
     free(buffer);
 
@@ -528,7 +583,6 @@ error_t InodeManager::get_inode_from_path(const char* path, ino_t start, Inode& 
     DirentManager& dirent_manager = DirentManager::instance();
 
     assert(path != nullptr);
-    assert(root != nullptr);
     assert(start < superblock.get_max_inum());
 
     Utilities::path_split p = { 0 };

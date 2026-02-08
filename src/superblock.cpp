@@ -3,6 +3,7 @@
 
 #include "myfs/superblock.hpp"
 #include "myfs/inode.hpp"
+#include "utilities.hpp"
 
 error_t SuperblockManager::save() {
     return storage.block_write(SUPERBLOCK_BLK_NUM, &_superblock);
@@ -116,6 +117,10 @@ uint16_t SuperblockManager::get_data_bitmap_blks() const {
     return _superblock.i_start_blk - _superblock.d_bitmap_blk;
 }
 
+uint16_t SuperblockManager::get_magic_num() const {
+    return _superblock.magic_num;
+}
+
 void SuperblockManager::increase_free_data_blk_count() {
     _superblock.free_blk_count++;
 }
@@ -132,4 +137,20 @@ void SuperblockManager::decrease_free_ino_count() {
     _superblock.free_ino_count--;
 }
 
-
+void SuperblockManager::print_info() {
+    DBG("magic num: %u", get_magic_num());
+    DBG("max inum: %u", get_max_inum());
+    DBG("max dnum: %u", get_max_dnum());
+    DBG("ino bitmap start at block: %u", get_ino_bm_start_blk());
+    DBG("ino bitmap end at block: %u", get_ino_bm_end_blk());
+    DBG("data bitmap start at block: %u", get_data_bm_start_blk());
+    DBG("data bitmap end at block: %u", get_data_bm_end_blk());
+    DBG("ino region start at block: %u", get_ino_region_start_blk());
+    DBG("ino region end at block: %u", get_ino_region_end_blk());
+    DBG("data region start at block: %u", get_data_region_start_blk());
+    DBG("data region end at block: %u", get_data_region_end_blk());
+    DBG("Num of ino bitmap blocks: %u", get_ino_bitmap_blks());
+    DBG("Num of data bitmap blocks: %u", get_data_bitmap_blks());
+    DBG("Free data blocks count: %u", get_free_data_blk_count());
+    DBG("Free ino count: %u", get_free_ino_count());
+}

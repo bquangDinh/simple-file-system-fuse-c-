@@ -51,6 +51,8 @@ error_t DataBlockManager::init() {
 }
 
 error_t DataBlockManager::get_available_blk(blk_t& out) {
+    DBG("Finding new data block");
+
     SuperblockManager& superblock = SuperblockManager::instance();
     StorageManager& storage = StorageManager::instance();
 
@@ -72,6 +74,8 @@ error_t DataBlockManager::get_available_blk(blk_t& out) {
     uint32_t offset = superblock.get_data_bm_start_blk();
 
     for (uint16_t i = 0; i < data_bitmap_blocks; ++i) {
+        DBG("Reading data bitmap at block: %u", offset + i);
+
         err = storage.block_read(offset + i, bitmap);
 
         if (err < 0) {
@@ -84,9 +88,17 @@ error_t DataBlockManager::get_available_blk(blk_t& out) {
             // No data block available
             if (j >= superblock.get_max_dnum() - 1) break;
 
+            DBG("Checking bit (%u) of bitmap", j - i * num_bits_per_block);
+
             if (Utilities::BitmapOps::get_bitmap(bitmap, j - i * num_bits_per_block) == 0) {
+                DBG("Bit (%u) is free to take", j - i * num_bits_per_block);
+
                 // Free data block found
                 Utilities::BitmapOps::set_bitmap(bitmap, j - i * num_bits_per_block);
+
+                DBG("Set bit (%u) in the bitmap", j - i * num_bits_per_block);
+
+                Utilities::print_bitmap_bits(bitmap, 10);
 
                 // Update bitmap
                 err = storage.block_write(offset + i, bitmap);
@@ -96,6 +108,8 @@ error_t DataBlockManager::get_available_blk(blk_t& out) {
 
                     return err;
                 }
+
+                DBG("Updated data bitmap at block: %u", offset + i);
 
                 free(bitmap);
 
@@ -122,6 +136,8 @@ error_t DataBlockManager::get_available_blk(blk_t& out) {
 
                 free(buffer);
 
+                DBG("memset 0 to block: %u", j + superblock.get_data_region_start_blk());
+
                 // Update superblock stat
                 superblock.decrease_free_data_blk_count();
 
@@ -129,7 +145,11 @@ error_t DataBlockManager::get_available_blk(blk_t& out) {
 
                 if (err < 0) return err;
 
+                DBG("Updated superblock free data blocks count to: %u", superblock.get_free_data_blk_count());
+
                 out = j + superblock.get_data_region_start_blk();
+
+                DBG("Allocated block %u", out);
 
                 return 0;
             }
@@ -137,6 +157,8 @@ error_t DataBlockManager::get_available_blk(blk_t& out) {
     }
 
     free(bitmap);
+
+    DBG("No data block available");
 
     return -ENOSPC;
 }
@@ -166,7 +188,7 @@ error_t DataBlockManager::release_data_block(blk_t blk) {
         return err;
     }
 
-    Utilities::BitmapOps::set_bitmap(bitmap, bit_idx);
+    Utilities::BitmapOps::unset_bitmap(bitmap, bit_idx);
 
     err = storage.block_write(block, bitmap);
 
@@ -195,6 +217,8 @@ error_t DataBlockManager::release_multi_data_blk(blk_t* blks, size_t len) {
     error_t err;
 
     for (size_t i = 0; i < len; ++i) {
+        if (blks[i] == 0) continue;
+        
         assert(blks[i] >= superblock.get_data_region_start_blk() && blks[i] <= superblock.get_data_region_end_blk());
 
         // TODO: optimize this

@@ -8,6 +8,8 @@
 #include "utilities.hpp"
 
 error_t DirentManager::dir_find(ino_t ino, const char* fname, dirent_t* out) {
+    DBG("ino: %u, fname: %s", ino, fname);
+
     SuperblockManager& superblock = SuperblockManager::instance();
     StorageManager& storage = StorageManager::instance();
     InodeManager& inode_manager = InodeManager::instance();
@@ -55,6 +57,8 @@ error_t DirentManager::dir_find(ino_t ino, const char* fname, dirent_t* out) {
 
                     free(buffer);
 
+                    DBG("Done.");
+
                     return 0;
                 }
             }
@@ -62,6 +66,8 @@ error_t DirentManager::dir_find(ino_t ino, const char* fname, dirent_t* out) {
     }
 
     free(buffer);
+
+    DBG("Item does not exist. Done");
 
     return -ENOENT;
 }
@@ -71,6 +77,8 @@ error_t DirentManager::dir_add(Inode& parent, const Inode& child, const char* fn
 }
 
 error_t DirentManager::dir_add(Inode& parent, ino_t child_ino, const char* fname) {
+    DBG("parent ino: %ld | child ino: %ld | fname: %s", parent.get_ino(), child_ino, fname);
+
     SuperblockManager& superblock = SuperblockManager::instance();
     StorageManager& storage = StorageManager::instance();
     InodeManager& inode_manager = InodeManager::instance();
@@ -79,11 +87,15 @@ error_t DirentManager::dir_add(Inode& parent, ino_t child_ino, const char* fname
     assert(child_ino < superblock.get_max_inum());
     assert(fname != nullptr);
 
+    DBG("Checking if parent ino (%ld) already has child ino (%ld)", parent.get_ino(), child_ino);
+
     // Check if this parent already has this child dirent
     error_t err = dir_find(parent.get_ino(), fname, nullptr);
 
     if (err == 0) return -EEXIST;
-    else if (err < 0) return err;
+    else if (err < 0 && err != -ENOENT) return err;
+
+    DBG("Child ino not yet exist. Good to add");
 
     // -ENAMETOOLONG is already reported in dir_find()
     //  so in here, we can assume the name is good
@@ -150,6 +162,8 @@ error_t DirentManager::dir_add(Inode& parent, ino_t child_ino, const char* fname
 
                 free(buffer);
 
+                DBG("Done.");
+
                 return 0;
             }
         }
@@ -172,6 +186,8 @@ error_t DirentManager::dir_add(Inode& parent, ino_t child_ino, const char* fname
 
         return err;
     }
+
+    DBG("Adding entry to fresly new block at index: %u | %u", blk_idx, data_block_idx);
 
     memset(buffer, 0, storage.BLOCK_SIZE);
 
@@ -200,10 +216,14 @@ error_t DirentManager::dir_add(Inode& parent, ino_t child_ino, const char* fname
 
     if (err) return err;
 
+    DBG("Done.");
+
     return 0;
 }
 
 error_t DirentManager::dir_remove(Inode& parent, const char* fname) {
+    DBG("parent ino: %ld | fname: %s", parent.get_ino(), fname);
+
     StorageManager& storage = StorageManager::instance();
 
     assert(fname != nullptr);
@@ -257,6 +277,8 @@ error_t DirentManager::dir_remove(Inode& parent, const char* fname) {
 
                 if (err < 0) return err;
 
+                DBG("Done.");
+
                 return 0;
             }
         }
@@ -265,10 +287,14 @@ error_t DirentManager::dir_remove(Inode& parent, const char* fname) {
     // target does not exist
     free(buffer);
 
+    DBG("Target does not exist. Done.");
+
     return -ENOENT;
 }
 
 int DirentManager::dir_entries_count(Inode& dir) {
+    DBG("dir ino: %ld", dir.get_ino());
+
     StorageManager& storage = StorageManager::instance();
 
     dirent_t* buffer = (dirent_t*)malloc(storage.BLOCK_SIZE);
@@ -303,10 +329,14 @@ int DirentManager::dir_entries_count(Inode& dir) {
 
     free(buffer);
 
+    DBG("Count = %u. Done.", count);
+
     return count;
 }
 
 int DirentManager::dir_entries_count(inode_t dir) {
+    DBG("dir ino: %ld", dir.ino);
+
     StorageManager& storage = StorageManager::instance();
 
     dirent_t* buffer = (dirent_t*)malloc(storage.BLOCK_SIZE);
@@ -341,10 +371,14 @@ int DirentManager::dir_entries_count(inode_t dir) {
 
     free(buffer);
 
+    DBG("count = %d. Done.", count);
+
     return count;
 }
 
 error_t DirentManager::dir_update_dotdot(Inode& dir_inode, Inode& new_parent) {
+    DBG("dir ino: %ld - new parent ino: %ld", dir_inode.get_ino(), new_parent.get_ino());
+
     StorageManager& storage = StorageManager::instance();
     InodeManager& inode_manager = InodeManager::instance();
 
@@ -415,12 +449,16 @@ error_t DirentManager::dir_update_dotdot(Inode& dir_inode, Inode& new_parent) {
 
                 free(buffer);
 
+                DBG("Done.");
+
                 return 0;
             }
         }
     }
 
     free(buffer);
+
+    DBG("Done.");
 
     return -ENOENT;
 }

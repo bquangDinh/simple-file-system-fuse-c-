@@ -2,6 +2,7 @@
 #define GNU_SOURCE
 
 #include <fuse3/fuse.h>
+#include <cstdio>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -17,6 +18,9 @@
 #include "myfs/data.hpp"
 #include "myfs/dirent.hpp"
 #include "utilities.hpp"
+
+#define DEBUG
+#define HAVE_UTIMESAT
 
 /* Helper Macros */
 #define ACCMODE_FROM_FLAG(flag) (flag & O_ACCMODE)
@@ -59,7 +63,7 @@ char diskfile_path[PATH_MAX];
 
 /* Thead Logs Ops */
 error_t thread_fd_open(const char* file) {
-	int fd = open(file, O_CREAT | O_WRONLY | O_TRUNC);
+	int fd = open(file, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
 
 	if (fd < 0) {
 		perror("open");
@@ -68,7 +72,7 @@ error_t thread_fd_open(const char* file) {
 	}
 
 	thread_log_fd = fdopen(fd, "w");
-
+	
 	if (!thread_log_fd) {
 		perror("fdopen");
 
@@ -76,6 +80,8 @@ error_t thread_fd_open(const char* file) {
 
 		return errno;
 	}
+
+	return 0;
 }
 
 error_t thread_fd_close() {
@@ -113,7 +119,7 @@ bool is_context_user_root() {
 error_t make_file(const char* path, mode_t mode, Inode& out) {
 	assert(path != nullptr);
 
-	DBG("path: %s | mode: %05o", path, mode & 0x7777);
+	DBG("path: %s | mode: %05o", path, mode & 07777);
 
 	uid_t uid = get_context_uid();
 	gid_t gid = get_context_gid();
@@ -151,7 +157,7 @@ error_t make_file(const char* path, mode_t mode, Inode& out) {
 
 	err = dirent_manager.dir_find(parent_inode.get_ino(), base, nullptr);
 
-	if (err <= 0) {
+	if (err <= 0 && err != -ENOENT) {
 		Utilities::free_path_split(&ps);
 
 		if (err == 0) return -EEXIST;
@@ -159,12 +165,18 @@ error_t make_file(const char* path, mode_t mode, Inode& out) {
 		return err;
 	}
 
-	Utilities::free_path_split(&ps);
+	DBG("Checking if parent inode can write");
 
 	// Check if user has permission to write into parent dir
 	if (!parent_inode.can_write()) {
+		DBG("Can't write parent inode. Permission denied");
+
+		Utilities::free_path_split(&ps);
+
 		return -EACCES;
 	}
+
+	DBG("Getting new ino for file");
 
 	// Get the next available inode number of this file
 	ino_t new_ino;
@@ -172,36 +184,60 @@ error_t make_file(const char* path, mode_t mode, Inode& out) {
 	err = inode_manager.get_available_ino(new_ino);
 
 	if (err < 0) {
+		Utilities::free_path_split(&ps);
+
 		return err;
 	}
+
+	DBG("New ino is %ld", new_ino);
 
 	// Acquire write lock on this new file inode
 	WR_LOCK(get_lock_for_inode(new_ino));
 
 	if (S_ISFIFO(mode)) {
-		out.from(new_ino, S_IFIFO & mode, 1, uid, gid);
+		out = Inode{new_ino, S_IFIFO | mode, 1, uid, gid};
 	} else if (S_ISREG(mode)) {
-		out.from(new_ino, S_IFREG & mode, 1, uid, gid);
+		out = Inode{new_ino, S_IFREG | mode, 1, uid, gid};
 	} else if (S_ISCHR(mode)) {
-		out.from(new_ino, S_IFCHR & mode, 1, uid, gid);
+		out = Inode{new_ino, S_IFCHR | mode, 1, uid, gid};
 	} else if (S_ISBLK(mode)) {
-		out.from(new_ino, S_IFBLK & mode, 1, uid, gid);
+		out = Inode{new_ino, S_IFBLK | mode, 1, uid, gid};
 	} else if (S_ISSOCK(mode)) {
-		out.from(new_ino, S_IFSOCK & mode, 1, uid, gid);
+		out = Inode{new_ino, S_IFSOCK | mode, 1, uid, gid};
+	} else if (S_ISLNK(mode)) {
+		out = Inode{new_ino, S_IFLNK | mode, 1, uid, gid};
 	} else {
+		Utilities::free_path_split(&ps);
+
 		return -EOPNOTSUPP;
 	}
 
 	// Update open count
 	out.inode.open_count++;
 
+	DBG("Update opencount to opencount = %u", out.inode.open_count);
+
 	err = out.save();
 
-	if (err < 0) return err;
+	if (err < 0) {
+		Utilities::free_path_split(&ps);
+
+		return err;
+	}
+
+	DBG("Saved inode %ld", new_ino);
 
 	err = dirent_manager.dir_add(parent_inode, new_ino, base);
+	
+	if (err < 0) {
+		Utilities::free_path_split(&ps);
+		
+		return err;
+	}
 
-	if (err < 0) return err;
+	Utilities::free_path_split(&ps);
+
+	DBG("Added entry to parent inode");
 
 	DBG("Done.");
 
@@ -497,22 +533,26 @@ static void* myfs_init(struct fuse_conn_info *conn, struct fuse_config* fconfig)
         exit(EXIT_FAILURE);
     }
 
-    DBG("Init inode manager");
-
-    err = inode_manager.init();
-
-    if (err < 0) {
-        perror("inode-init");
-
-        exit(EXIT_FAILURE);
-    }
-
-    DBG("Init datablock manager");
+	// HAVE TO INIT DATA BLOCK MANAGER FIRST
+	// Since if inode is init first, the data bitmap will be reset back to zero when init data block manager
+	DBG("Init datablock manager");
 
     err = datablock_manager.init();
 
     if (err < 0) {
         perror("datablock-init");
+
+        exit(EXIT_FAILURE);
+    }
+
+    DBG("Init inode manager");
+
+	superblock.print_info();
+
+    err = inode_manager.init();
+
+    if (err < 0) {
+        perror("inode-init");
 
         exit(EXIT_FAILURE);
     }
@@ -540,6 +580,8 @@ static int myfs_getattr(const char* path, struct stat *st_buf, struct fuse_file_
 
 	Inode finode;
 
+	DBG("Getting inode...");
+
 	error_t err = inode_manager.get_inode_from_path(path, ROOT_INO, finode);
 
 	if (err < 0) {
@@ -547,6 +589,8 @@ static int myfs_getattr(const char* path, struct stat *st_buf, struct fuse_file_
 
 		return err;
 	}
+
+	DBG("Inode is: %ld - nlink = %u - opencount = %u", finode.get_ino(), finode.inode.nlink, finode.inode.open_count);
 
 	// Acquire read lock
 	RD_LOCK(get_lock_for_inode(finode.get_ino()));
@@ -660,7 +704,7 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 
 		blk = dir_inode->get_block_direct_at(blk_idx);
 
-		err = storage.block_read(blk, buffer);
+		err = storage.block_read(blk, dirent_buffer);
 
 		if (err < 0) {
 			free(dirent_buffer);
@@ -672,6 +716,8 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 			entry = dirent_buffer[i];
 
 			if (entry.valid == 1) {
+				DBG("ino %ld has entry [%u] of name %s", dir_inode->get_ino(), i, entry.name);
+
 				if (filler(buffer, entry.name, nullptr, 0, (fuse_fill_dir_flags)0) != 0) {
 					free(dirent_buffer);
 
@@ -728,7 +774,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	// Check if the target directory already exists
 	err = dirent_manager.dir_find(parent_inode.get_ino(), base, nullptr);
 
-	if (err <= 0) {
+	if (err <= 0 && err != -ENOENT) {
 		Utilities::free_path_split(&ps);
 
 		if (err == 0) return -EEXIST;	
@@ -761,17 +807,17 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 
 	DBG("Create new directory inode with ino: %ld", new_ino);
 
-	Inode new_dir_inode{new_ino, S_IFDIR & mode, 2, uid, gid};
+	Inode new_dir_inode{new_ino, S_IFDIR | mode, 2, uid, gid};
 
 	err = new_dir_inode.save();
-
-	DBG("Saved new directory inode");
 
 	if (err < 0) {
 		Utilities::free_path_split(&ps);
 
 		return err;
 	}
+
+	DBG("Saved new directory inode");
 
 	// Add "." self
 	err = dirent_manager.dir_add(new_dir_inode, new_ino, ".");
@@ -792,7 +838,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 		return err;
 	}
 
-	DBG("Added '..' entry (%ld) to new dir inode: %ld", parent_inode->get_ino(), new_ino);
+	DBG("Added '..' entry (%ld) to new dir inode: %ld", parent_inode.get_ino(), new_ino);
 
 	err = dirent_manager.dir_add(parent_inode, new_dir_inode, base);
 
@@ -802,7 +848,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 		return err;	
 	}
 
-	DBG("Added entry of ino: %ld to parent dir (%ld)", new_dir_inode->get_ino(), parent_inode->get_ino());
+	DBG("Added entry of ino: %ld to parent dir (%ld)", new_dir_inode.get_ino(), parent_inode.get_ino());
 
 	// Update nlink of parent inode
 	parent_inode.inode.nlink++;
@@ -815,7 +861,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 		return err;	
 	}
 
-	DBG("Updated nlink of parent inode (%ld) to nlink = %u", parent_inode->get_ino(), parent_inode->inode.nlink);
+	DBG("Updated nlink of parent inode (%ld) to nlink = %u", parent_inode.get_ino(), parent_inode.inode.nlink);
 
 	Utilities::free_path_split(&ps);
 
@@ -825,7 +871,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 }
 
 static int myfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
-	DBG("path: %s | mode: %05o", path, mode & 0x7777);
+	DBG("path: %s | mode: %05o", path, mode & 07777);
 
 	Inode* finode = new Inode();
 
@@ -1932,98 +1978,32 @@ static int myfs_flock(const char* path, struct fuse_file_info *fi, int op) {
 }
 
 static int myfs_symlink(const char* target, const char* link) {
-	Utilities::path_split ps = { 0 };
+	DBG("target: %s | link: %s", target, link);
 
-	if (Utilities::split_path(link, &ps) > 0) {
-		return -ENOMEM;
-	}
+	Inode link_inode;
 
-	char *base = ps.base;
-	char *dir = ps.dir;
-
-	Inode parent_inode;
-
-	error_t err = inode_manager.get_inode_from_path(dir, ROOT_INO, parent_inode);
+	error_t err = make_file(link, S_IFLNK | 0755, link_inode);
 
 	if (err < 0) {
-		Utilities::free_path_split(&ps);
-
 		return err;
 	}
 
-	WR_LOCK(get_lock_for_inode(parent_inode.get_ino()));
-
-	if (!parent_inode.is_valid()) {
-		Utilities::free_path_split(&ps);
-
-		return -ENOENT;
-	}
-
-	// Check if the target already exists
-	err = dirent_manager.dir_find(parent_inode.get_ino(), base, nullptr);
-
-	if (err <= 0) {
-		Utilities::free_path_split(&ps);
-		
-		if (err == 0) return -EEXIST;
-
-		return err;
-	}
-
-	ino_t new_ino;
-
-	err = inode_manager.get_available_ino(new_ino);
-
-	if (err < 0) {
-		Utilities::free_path_split(&ps);
-
-		return err;
-	}
-
-	WR_LOCK(get_lock_for_inode(new_ino));
-
-	if (!parent_inode.can_write()) {
-		Utilities::free_path_split(&ps);
-
-		return -EACCES;
-	}
-
-	Inode new_file_inode{new_ino, S_IFLNK & 0755, 1, get_context_uid(), get_context_gid()};
-
-	err = new_file_inode.save();
-
-	if (err < 0) {
-		Utilities::free_path_split(&ps);
-
-		return err;
-	}
-
-	err = dirent_manager.dir_add(parent_inode, new_ino, base);
-
-	if (err < 0) {
-		Utilities::free_path_split(&ps);
-
-		return err;
-	}
+	DBG("Writing file path of target: %s", target);
 
 	// Write path to symlink
 	size_t buffer_size = strlen(target) + 1;
 
 	if (buffer_size > StorageManager::BLOCK_SIZE) {
-		Utilities::free_path_split(&ps);
-
 		return -ENOSPC;
 	}
 
-	err = write_file(new_file_inode, target, buffer_size, 0);
+	err = write_file(link_inode, target, buffer_size, 0);
 
 	if (err < 0) {
-		Utilities::free_path_split(&ps);
-
 		return err;
 	}
 
-	Utilities::free_path_split(&ps);
+	DBG("Done.");
 
 	return 0;
 }
@@ -2138,6 +2118,8 @@ static int myfs_mknod(const char* path, mode_t mode, dev_t dev) {
 }
 
 static int myfs_access(const char* path, int mode) {
+	DBG("path: %s | mode: %d", path, mode);
+
 	Inode finode;
 
 	error_t err = inode_manager.get_inode_from_path(path, ROOT_INO, finode);
@@ -2160,19 +2142,21 @@ static int myfs_access(const char* path, int mode) {
 	switch (mode) {
 		case R_OK:
 			// User wants to know if they can read this file
-			return finode.can_read();
+			return finode.can_read() ? 0 : -EACCES;
 		case W_OK:
 			// User wants to know if they can write this file
-			return finode.can_write();
+			return finode.can_write() ? 0 : -EACCES;
 		case X_OK:
 			// User wants to know if they can execute this file
-			return finode.can_execute();
+			return finode.can_execute() ? 0 : -EACCES;
 	}
 
 	return -EINVAL;
 }
 
 static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) {
+	DBG("path: %s | mode: %05o", path, mode);
+
 	Inode finode;
 
 	error_t err = inode_manager.get_inode_from_path(path, ROOT_INO, finode);
@@ -2191,8 +2175,8 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 	// Check if user trying to add set_uid bit in the request
 	// If the file's mode already have set_uid bit, it is considered not "adding"
 	// If user trying to add set_gid bit in the request, it is allowed if user belongs to gid group, otherwise disallowed
-	mode_t old_perm = finode.inode.mode & 0x7777;
-	mode_t req_perm = mode & 0x7777;
+	mode_t old_perm = finode.inode.mode & 07777;
+	mode_t req_perm = mode & 07777;
 
 	bool is_owner_or_root = finode.user_is_owner() || is_context_user_root();
 	bool adding_suid, adding_sgid;
@@ -2227,25 +2211,35 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 	// and wish to setgid bit
 	// the request is still forwarded but the setgid bit is cleared
 	if ((req_perm & S_ISGID) && !finode.user_is_group() && !is_context_user_root()) {
+		DBG("Clear sgid bit");
+
 		// Clear sgid bit
 		req_perm &= ~S_ISGID;
 	}
 
 	// Clear suid bit if user is not root, but the requested perm has it
 	if ((req_perm & S_ISUID) && !is_context_user_root()) {
+		DBG("Clear suid bit");
+
 		// Clear suid bit
 		req_perm &= ~S_ISUID;
 	}
 
+	DBG("req_perm is: %05o", req_perm);
+
 	// Can change mode
 	// Keep type bits, change permission bits
 	finode.inode.mode = (finode.inode.mode & S_IFMT) | req_perm;
+
+	DBG("changed mode to: %05o", finode.inode.mode);
 
 	err = finode.save();
 
 	if (err < 0) {
 		return err;
 	}
+
+	DBG("Done");
 
 	return 0;
 }
@@ -2385,5 +2379,5 @@ int main(int argc, char* argv[]) {
 	// Start FUSE
 	fuse_stat = fuse_main(argc, argv, &myfs_ope, NULL);
 	
-	return fuse_stat;
+	return 0;
 }

@@ -93,6 +93,8 @@ public:
 
     // Release this inode back to inode bitmap and all of its associated data blocks
     error_t release();
+    
+    void print_info();
 };
 
 class InodeManager {

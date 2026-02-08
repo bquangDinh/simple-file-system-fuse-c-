@@ -84,4 +84,6 @@ public:
 
     void increase_free_ino_count();
     void decrease_free_ino_count();
+
+    void print_info();
 };
