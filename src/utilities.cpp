@@ -132,3 +132,67 @@ mode_t Utilities::PermissionOps::get_group_perm(mode_t mode) {
 mode_t Utilities::PermissionOps::get_other_perm(mode_t mode) {
 	return mode & 7;
 }
+
+bool Utilities::ProcessOps::pid_has_group(pid_t pid, gid_t target) {
+	char path[64];
+	
+	// Read process's status file
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+
+	FILE* file = fopen(path, "r");
+
+	if (!file) {
+		return false;
+	}
+
+	char *line = nullptr;
+	size_t n = 0;
+	bool ok = false;
+
+	// Keep reading new line until we reach line named "Group: ...."
+	while (getline(&line, &n, file) != -1) {
+		if (strncmp(line, "Groups:", 7) == 0) {
+			// Start reading numbers after the "Groups:"
+			char *p = line + 7;
+
+			// Not yet end of line
+			while (*p) {
+				// Ignore space and tab
+				if (*p == ' ' || *p == '\t') p++;
+
+				// If we reached new line, then it is the end
+				if (*p == '\n') {
+					break;
+				}
+
+				// Convert string to number
+				// The second parameter &p is used to store the first invalid chacracter
+				// after the number, thus moving pointer forward
+				unsigned long g = strtoul(p, &p, 10);
+
+				printf("%lu ", g);
+
+				if ((gid_t)g == target) {
+					ok = true;
+
+					break;
+				}
+			}
+
+			break;
+		}
+	}
+
+	free(line);
+
+	fclose(file);
+
+	return ok;
+}
+
+bool Utilities::ProcessOps::gid_belongs_to_user_group(pid_t pid, gid_t primary, gid_t target) {
+	if (target == primary) return true;
+
+	// Check if target belongs to the user's group
+	return Utilities::ProcessOps::pid_has_group(pid, target);
+}

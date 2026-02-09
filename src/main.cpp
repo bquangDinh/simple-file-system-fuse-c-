@@ -112,6 +112,14 @@ gid_t get_context_gid() {
 	return ctx->gid;
 }
 
+pid_t get_context_pid() {
+	fuse_context* ctx = fuse_get_context();
+
+	assert(ctx != nullptr);
+
+	return ctx->pid;
+}
+
 bool is_context_user_root() {
 	return get_context_uid() == 0;
 }
@@ -195,17 +203,17 @@ error_t make_file(const char* path, mode_t mode, Inode& out) {
 	WR_LOCK(get_lock_for_inode(new_ino));
 
 	if (S_ISFIFO(mode)) {
-		out = Inode{new_ino, S_IFIFO | mode, 1, uid, gid};
+		out = Inode{new_ino, S_IFIFO | (mode & 07777), 1, uid, gid};
 	} else if (S_ISREG(mode)) {
-		out = Inode{new_ino, S_IFREG | mode, 1, uid, gid};
+		out = Inode{new_ino, S_IFREG | (mode & 07777), 1, uid, gid};
 	} else if (S_ISCHR(mode)) {
-		out = Inode{new_ino, S_IFCHR | mode, 1, uid, gid};
+		out = Inode{new_ino, S_IFCHR | (mode & 07777), 1, uid, gid};
 	} else if (S_ISBLK(mode)) {
-		out = Inode{new_ino, S_IFBLK | mode, 1, uid, gid};
+		out = Inode{new_ino, S_IFBLK | (mode & 07777), 1, uid, gid};
 	} else if (S_ISSOCK(mode)) {
-		out = Inode{new_ino, S_IFSOCK | mode, 1, uid, gid};
+		out = Inode{new_ino, S_IFSOCK | (mode & 07777), 1, uid, gid};
 	} else if (S_ISLNK(mode)) {
-		out = Inode{new_ino, S_IFLNK | mode, 1, uid, gid};
+		out = Inode{new_ino, S_IFLNK | (mode & 07777), 1, uid, gid};
 	} else {
 		Utilities::free_path_split(&ps);
 
@@ -871,7 +879,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 }
 
 static int myfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
-	DBG("path: %s | mode: %05o", path, mode & 07777);
+	DBG("path: %s | mode: %o", path, mode);
 
 	Inode* finode = new Inode();
 
@@ -1055,6 +1063,20 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 	error_t res = write_file(*finode, buffer, size, offset);
 
 	if (res < 0) return res;
+
+	// Non owner of the file with suid bit and sgid bit set should be cleared upon return
+	if (finode->inode.mode & (S_ISUID | S_ISGID)) {
+		// Non owner or non root
+		if (!finode->user_is_owner() && !is_context_user_root()) {
+			finode->inode.mode &= ~(S_ISUID | S_ISGID);
+
+			error_t err = finode->save();
+
+			if (err < 0) {
+				return err;
+			}
+		}
+	}
 
 	DBG("Bytes written: %zu", res);
 
@@ -1623,11 +1645,13 @@ static int myfs_unlink(const char* path) {
 }
 
 static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
+	DBG("path: %s | size: %zu", path, size);
+	
 	Inode* finode = nullptr;
 	error_t err;
 	file_handler* fh = nullptr;
 	bool should_deleted = false;
-
+	
 	if (fi != nullptr && fi->fh != 0) {
 		file_handler* fh = (file_handler*)fi->fh;
 
@@ -1660,19 +1684,26 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 
 	// Check if the file is opened through open()
 	if (fh != nullptr) {
+		DBG("truncate through open()");
+
 		int access_mode = ACCMODE_FROM_FLAG(fh->flags);
 		
 		// Check if user specify flags that allow file to be written
 		bool can_write = ACCMODE_REQUEST_WRITE(access_mode);
-
+		
 		if (!can_write) {
+			DBG("user did not specify WRITE flag, deny access");
 			// don't delete finode here as fi->finode stil carries it
 			// finode will be deleted in myfs_release()
 			return -EACCES;
 		}
 	} else {
+		DBG("truncate through calling truncate()");
+
 		// Check if user has write permission on finode
 		if (!finode->can_write()) {
+			DBG("user does not have permission to write this file | acting user is: %u | owner is: %u | mode: %05o", get_context_uid(), finode->inode.uid, finode->inode.mode);
+
 			// finode is allocated locally
 			if (should_deleted) delete finode;
 
@@ -1680,6 +1711,22 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		}
 	}
 	
+	// If non owner changing file content with suid, sgid bit set
+	// suid, and sgid bit should be cleared upon return
+	if (finode->inode.mode & (S_ISUID | S_ISGID)) {
+		if (!finode->user_is_owner() && !is_context_user_root()) {
+			finode->inode.mode &= ~(S_ISUID | S_ISGID);
+
+			err = finode->save();
+
+			if (err < 0) {
+				if (should_deleted) delete finode;
+
+				return err;
+			}
+		}
+	}
+
 	// Maximum file size myfs allows
 	uint32_t MAX_SIZE = DIRECT_PTRS_COUNT * StorageManager::BLOCK_SIZE + (StorageManager::BLOCK_SIZE / sizeof(blk_t)) * StorageManager::BLOCK_SIZE;
 
@@ -2210,6 +2257,8 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 	// If user is owner but not belongs to the item's group
 	// and wish to setgid bit
 	// the request is still forwarded but the setgid bit is cleared
+	DBG("Should clear sgid bit? sgid present: %u | user belongs to group: %u | root: %u | acting uid: %u | acting gid: %u", (req_perm & S_ISGID), finode.user_is_group(), is_context_user_root(), get_context_uid(), get_context_gid());
+
 	if ((req_perm & S_ISGID) && !finode.user_is_group() && !is_context_user_root()) {
 		DBG("Clear sgid bit");
 
@@ -2253,28 +2302,49 @@ static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_i
 
 	WR_LOCK(get_lock_for_inode(finode.get_ino()));
 
-	if (uid != finode.inode.uid) {
-		// User wish to change uid
-		// Only root can change uid
-		if (!is_context_user_root()) return -EPERM;
-	}
+	pid_t pid = get_context_pid();
+	gid_t user_primary_gid = get_context_gid();
 
-	if (gid != finode.inode.gid) {
-		// User wish to change gid
+	if (uid != (uid_t)-1) {
+		// If no change in uid, the user still must be the owner or root to pass
+		if (uid == finode.inode.uid) {
+			if (!finode.user_is_owner() && !is_context_user_root()) return -EPERM;
+		} else {
+			// User wish to change uid that is different than inode uid
+			// Only root can change uid
+			if (!is_context_user_root()) return -EPERM;
 
-		// Root can change gid
+			// Apply change
+			finode.inode.uid = uid;
+		}
+	}	
 
-		// Non-root user can change gid if:
-		// - User owns the file AND the group of this item belongs to the user's groups
-		// Since FUSE does not provide the list of groups that user belongs to
-		// I gotta skip that condition and only check for primary group
-		if (!is_context_user_root() && (!finode.user_is_owner() || !finode.user_is_group())) {
-			return -EPERM;
+	if (gid != (gid_t)-1) {
+		if (gid == finode.inode.gid) {
+			if (!finode.user_is_owner() && !is_context_user_root()) return -EPERM;
+		} else {
+			// User wish to change gid
+
+			// Root can change gid
+
+			// Non-root user can change gid if:
+			// - User owns the file AND the group of this item belongs to the user's groups
+			// The second condition means the GID user wanted to change must own by the user's group list
+			// Meaning user can change group id to other group id that belongs to him, not someone else
+			// Ex: A owns the group [10, 20, 65534] and has primary group of 65535 and wish to change it to 30
+			// he can't because it neither equals to the primary group (65535) or belongs to the group list [10, 20, 65534]
+			if (
+				!is_context_user_root() && // user is not the root user
+				(!finode.user_is_owner() || // user does not own the file
+				!Utilities::ProcessOps::gid_belongs_to_user_group(pid, user_primary_gid, gid)) // the requested gid is not owned by user
+			) {
+				return -EPERM;
+			}
+
+			// Apply change
+			finode.inode.gid = gid;
 		}
 	}
-
-	finode.inode.uid = uid;
-	finode.inode.gid = gid;
 
 	// Clear suid, sgid bits if non root
 	if (!is_context_user_root()) {

@@ -15,13 +15,6 @@
 /* --------------- Inode class ------------------ */
 Inode::Inode()
 {
-    fuse_context* ctx = fuse_get_context();
-
-    assert(ctx != nullptr);
-
-    context_uid = ctx->uid;
-    context_gid = ctx->gid;
-
     inode = { 0 };
 
     inode.valid = 1;
@@ -30,13 +23,6 @@ Inode::Inode()
 Inode::Inode(ino_t ino, mode_t mode, nlink_t nlink, uid_t uid, gid_t gid)
 {
     assert(ino < SuperblockManager::instance().get_max_inum());
-
-    fuse_context* ctx = fuse_get_context();
-
-    assert(ctx != nullptr);
-
-    context_uid = ctx->uid;
-    context_gid = ctx->gid;
 
     inode.ino = ino;
     inode.valid = 1;
@@ -58,13 +44,6 @@ Inode::Inode(ino_t ino, mode_t mode, nlink_t nlink, uid_t uid, gid_t gid)
 
 Inode::Inode(const Inode& from)
 {
-    fuse_context* ctx = fuse_get_context();
-
-    assert(ctx != nullptr);
-
-    context_uid = ctx->uid;
-    context_gid = ctx->gid;
-
     inode.ino = from.inode.ino;
     inode.valid = from.inode.valid;
     inode.size = from.inode.size;
@@ -142,17 +121,38 @@ ino_t Inode::get_ino() const {
 bool Inode::can_write() {
     mode_t perm = get_perm_based_ctx();
 
+    // Saving uid at init is not a good idea since context_uid may change at any time during execution
+    struct fuse_context* ctx = fuse_get_context();
+
+    assert(ctx != nullptr);
+
+    uid_t context_uid = ctx->uid;
+
     return PERM_CAN_WRITE(perm) || IS_ROOT(context_uid);
 }
 
 bool Inode::can_read() {
     mode_t perm = get_perm_based_ctx();
 
+    // Saving uid at init is not a good idea since context_uid may change at any time during execution
+    struct fuse_context* ctx = fuse_get_context();
+
+    assert(ctx != nullptr);
+
+    uid_t context_uid = ctx->uid;
+
     return PERM_CAN_READ(perm) || IS_ROOT(context_uid);
 }
 
 bool Inode::can_execute() {
     mode_t perm = get_perm_based_ctx();
+
+    // Saving uid at init is not a good idea since context_uid may change at any time during execution
+    struct fuse_context* ctx = fuse_get_context();
+
+    assert(ctx != nullptr);
+
+    uid_t context_uid = ctx->uid;
 
     return PERM_CAN_EXECUTE(perm) || IS_ROOT(context_uid);
 }
@@ -317,11 +317,25 @@ bool Inode::should_file_be_deleted() {
 }
 
 bool Inode::user_is_owner() {
+    // Saving uid at init is not a good idea since context_uid may change at any time during execution
+    struct fuse_context* ctx = fuse_get_context();
+
+    assert(ctx != nullptr);
+
+    uid_t context_uid = ctx->uid;
+
     return context_uid == inode.uid;
 }
 
 bool Inode::user_is_group() {
-    return context_gid = inode.gid;
+    // Saving gid at init is not a good idea since context_uid may change at any time during execution
+    struct fuse_context* ctx = fuse_get_context();
+
+    assert(ctx != nullptr);
+
+    uid_t context_gid = ctx->gid;
+
+    return context_gid == inode.uid;
 }
 /* ---------------------------------------------- */
 

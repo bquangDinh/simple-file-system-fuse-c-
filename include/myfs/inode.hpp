@@ -40,9 +40,6 @@ struct inode_t {
 };
 
 class Inode {
-private:
-    uid_t context_uid;
-    gid_t context_gid;
 public:
     inode_t inode;
 

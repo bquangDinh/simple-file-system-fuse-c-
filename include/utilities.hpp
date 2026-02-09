@@ -39,7 +39,7 @@ namespace Utilities {
 
     void print_hex(const char* str, size_t len);
 
-    void print_bitmap_bits(const bitmap_t bitmap, size_t bytes);
+    void print_bitmap_bits(const bitmap_t bitmap, size_t bits);
 
     void debug(const char* file, int line, const char* func, const char* fmt, ...);
 
@@ -54,6 +54,14 @@ namespace Utilities {
         for (size_t i = 0; i < len; ++i) {
             arr[i] = value;
         }
+    }
+
+    namespace ProcessOps {
+        // Check if a given process id's group list contain the given target group id
+        bool pid_has_group(pid_t pid, gid_t target);
+
+        // Check if the target group belongs to the user's group list or user's primary group id
+        bool gid_belongs_to_user_group(pid_t pid, gid_t primary, gid_t target);
     }
 
     namespace BitmapOps {
