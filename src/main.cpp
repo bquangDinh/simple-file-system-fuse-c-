@@ -510,6 +510,128 @@ error_t write_file(Inode& finode, const char* buffer, size_t size, off_t offset)
 	return bytes_written;
 }
 
+error_t truncate_file(Inode& finode, off_t size) {
+	error_t err;
+
+	// Acquire write lock on finode
+	WR_LOCK(get_lock_for_inode(finode.get_ino()));
+
+	// Check if inode is a directory
+	if (finode.is_dir()) {
+		return -EISDIR;
+	}
+
+	// Maximum file size myfs allows
+	uint32_t MAX_SIZE = DIRECT_PTRS_COUNT * StorageManager::BLOCK_SIZE + (StorageManager::BLOCK_SIZE / sizeof(blk_t)) * StorageManager::BLOCK_SIZE;
+
+	if (size >= MAX_SIZE) {
+		return -EFBIG;
+	}
+
+	if (finode.inode.size == size) {
+		// Do nothing since file size already equals to the requested size
+		// Only update atime
+		return 0;
+	}
+
+	if (finode.inode.size == 0 || finode.inode.size < size) {
+		// 0 or expanding
+		// simply set file size to size
+		// I no need to allocate block here as it will be lazily allocated
+		finode.inode.size = size;
+
+		// Update time
+		finode.inode.atime = Utilities::now();
+		finode.inode.mtime = Utilities::now();
+
+		err = finode.save();
+
+		if (err < 0) {
+			return err;
+		}
+
+		return 0;
+	}
+
+	// Shrinking case
+	uint32_t start_removed_blk_offset = size % StorageManager::BLOCK_SIZE;
+	uint32_t start_removed_blk_idx = size / StorageManager::BLOCK_SIZE;
+	uint32_t end_removed_blk_idx = finode.inode.size / StorageManager::BLOCK_SIZE;	
+
+	// If offset is 0, it means we gonna include removing the start block
+	start_removed_blk_idx = (start_removed_blk_offset == 0) ? start_removed_blk_idx : start_removed_blk_idx + 1;
+
+	blk_t* indirect_buf = NULL;
+	uint16_t blk_off;
+	uint16_t num_blk_per_indirect = StorageManager::BLOCK_SIZE / sizeof(blk_t);
+
+	for (uint16_t blk_idx = start_removed_blk_idx; blk_idx <= end_removed_blk_idx; ++blk_idx) {
+		if (blk_idx < DIRECT_PTRS_COUNT) {
+			if (!finode.is_direct_allocated_at(blk_idx)) continue;
+
+			err = datablock_manager.release_data_block(finode.get_block_direct_at(blk_idx));
+
+			if (err < 0) {
+				if (indirect_buf != nullptr) free(indirect_buf);
+
+				return err;
+			}
+		} else {
+			if (!finode.is_singly_indirect_allocated()) {
+				// The data blocks are in indirect region but it is unallocated
+				// so there is no need to perform releasing data block
+				break;
+			}
+
+			blk_off = blk_idx - DIRECT_PTRS_COUNT;
+
+			if (indirect_buf == nullptr) {
+				indirect_buf = (blk_t*)malloc(StorageManager::BLOCK_SIZE);
+
+				if (indirect_buf == nullptr) {
+					return -ENOMEM;
+				}
+			}
+
+			err = finode.get_indirect_blk_data(indirect_buf);
+
+			if (err < 0) {
+				if (indirect_buf != nullptr) free(indirect_buf);
+
+				return err;
+			}
+
+			if (indirect_buf[blk_off] == 0) continue;
+
+			err = datablock_manager.release_data_block(indirect_buf[blk_off]);
+
+			if (err < 0) {
+				if (indirect_buf != nullptr) free(indirect_buf);
+
+				return err;
+			}
+		}
+	}
+
+	if (indirect_buf != nullptr) free(indirect_buf);
+
+	// TODO: should do truncate in two cases (in direct and in indirect region)
+
+	// Update size
+	finode.inode.size = size;
+
+	// Update time
+	finode.inode.atime = Utilities::now();
+	finode.inode.mtime = Utilities::now();
+
+	err = finode.save();
+
+	if (err < 0) {
+		return err;
+	}
+
+	return 0;
+}
 /* --------------- FUSE OPERATIONS ------------------------ */
 static void* myfs_init(struct fuse_conn_info *conn, struct fuse_config* fconfig) {
     assert(diskfile_path != nullptr);
@@ -640,6 +762,8 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 	int access_mode = ACCMODE_FROM_FLAG(fi->flags);
 	int need_read = ACCMODE_REQUEST_READ(access_mode);
 	int need_write = ACCMODE_REQUEST_WRITE(access_mode);
+
+	DBG("file: %s | need_read %d (can: %d) | need_write %d (can: %d)", path, need_read, dir_inode->can_read(), need_write, dir_inode->can_write());
 
 	// Check permission bit
 	if (need_read && !dir_inode->can_read()) return -EACCES;
@@ -932,6 +1056,9 @@ static int myfs_open(const char* path, struct fuse_file_info *fi) {
 	int access_mode = ACCMODE_FROM_FLAG(fi->flags);
 	int need_read = ACCMODE_REQUEST_READ(access_mode);
 	int need_write = ACCMODE_REQUEST_WRITE(access_mode);
+	int need_truncate = fi->flags & O_TRUNC;
+
+	DBG("file: %s | need_read %d (can: %d) | need_write %d (can: %d)", path, need_read, finode->can_read(), need_write, finode->can_write());
 
 	if (need_read && !finode->can_read()) {
 		delete finode;
@@ -945,8 +1072,25 @@ static int myfs_open(const char* path, struct fuse_file_info *fi) {
 		return -EACCES;
 	}
 
+	if (need_truncate) {
+		// make sure the file can be written
+		if (!finode->can_write()) return -EACCES;
+
+		// truncate file to zero
+		err = truncate_file(*finode, 0);
+
+		if (err < 0) {
+			delete finode;
+
+			return err;
+		}
+	}
+
 	// Update opencount
 	finode->inode.open_count++;
+	
+	// Update time
+	finode->inode.atime = Utilities::now();
 
 	err = finode->save();
 
@@ -1060,7 +1204,7 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 		return -EISDIR;
 	}
 
-	error_t res = write_file(*finode, buffer, size, offset);
+	error_t res = write_file(*finode, buffer, size, (fi->flags & O_APPEND != 0) ? finode->inode.size : offset);
 
 	if (res < 0) return res;
 
@@ -1600,7 +1744,7 @@ static int myfs_unlink(const char* path) {
 
 	if (parent_inode.is_dir_sticky()) {
 		if (
-			is_context_user_root() &&			// user is not the root user
+			!is_context_user_root() &&			// user is not the root user
 			!parent_inode.user_is_owner() &&	// user does not own parent directory
 			!finode.user_is_owner()				// user does not own item being unlinked
 		) {
@@ -1672,8 +1816,8 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 
 	assert(finode != nullptr);
 
-	// Acquire write lock on finode
-	WR_LOCK(get_lock_for_inode(finode->get_ino()));
+	// Acquire read lock on finode
+	RD_LOCK(get_lock_for_inode(finode->get_ino()));
 
 	// Check if inode is a directory
 	if (finode->is_dir()) {
@@ -1727,133 +1871,11 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		}
 	}
 
-	// Maximum file size myfs allows
-	uint32_t MAX_SIZE = DIRECT_PTRS_COUNT * StorageManager::BLOCK_SIZE + (StorageManager::BLOCK_SIZE / sizeof(blk_t)) * StorageManager::BLOCK_SIZE;
-
-	if (size >= MAX_SIZE) {
-		if (should_deleted) delete finode;
-
-		return -EFBIG;
-	}
-
-	if (finode->inode.size == size) {
-		// Do nothing since file size already equals to the requested size
-		// Only update atime
-		finode->inode.atime = Utilities::now();
-
-		err = finode->save();
-
-		if (err < 0) {
-			if (should_deleted) delete finode;
-
-			return err;
-		}
-
-		return 0;
-	}
-
-	if (finode->inode.size == 0 || finode->inode.size < size) {
-		// 0 or expanding
-		// simply set file size to size
-		// I no need to allocate block here as it will be lazily allocated
-		finode->inode.size = size;
-
-		// Update time
-		finode->inode.atime = Utilities::now();
-		finode->inode.mtime = Utilities::now();
-
-		err = finode->save();
-
-		if (err < 0) {
-			if (should_deleted) delete finode;
-
-			return err;
-		}
-
-		return 0;
-	}
-
-	// Shrinking case
-	uint32_t start_removed_blk_offset = size % StorageManager::BLOCK_SIZE;
-	uint32_t start_removed_blk_idx = size / StorageManager::BLOCK_SIZE;
-	uint32_t end_removed_blk_idx = finode->inode.size / StorageManager::BLOCK_SIZE;	
-
-	// If offset is 0, it means we gonna include removing the start block
-	start_removed_blk_idx = (start_removed_blk_offset == 0) ? start_removed_blk_idx : start_removed_blk_idx + 1;
-
-	blk_t* indirect_buf = NULL;
-	uint16_t blk_off;
-	uint16_t num_blk_per_indirect = StorageManager::BLOCK_SIZE / sizeof(blk_t);
-
-	for (uint16_t blk_idx = start_removed_blk_idx; blk_idx <= end_removed_blk_idx; ++blk_idx) {
-		if (blk_idx < DIRECT_PTRS_COUNT) {
-			if (!finode->is_direct_allocated_at(blk_idx)) continue;
-
-			err = datablock_manager.release_data_block(finode->get_block_direct_at(blk_idx));
-
-			if (err < 0) {
-				if (should_deleted) delete finode;
-				if (indirect_buf != nullptr) free(indirect_buf);
-
-				return err;
-			}
-		} else {
-			if (!finode->is_singly_indirect_allocated()) {
-				// The data blocks are in indirect region but it is unallocated
-				// so there is no need to perform releasing data block
-				break;
-			}
-
-			blk_off = blk_idx - DIRECT_PTRS_COUNT;
-
-			if (indirect_buf == nullptr) {
-				indirect_buf = (blk_t*)malloc(StorageManager::BLOCK_SIZE);
-
-				if (indirect_buf == nullptr) {
-					if (should_deleted) delete finode;
-
-					return -ENOMEM;
-				}
-			}
-
-			err = finode->get_indirect_blk_data(indirect_buf);
-
-			if (err < 0) {
-				if (should_deleted) delete finode;
-				if (indirect_buf != nullptr) free(indirect_buf);
-
-				return err;
-			}
-
-			if (indirect_buf[blk_off] == 0) continue;
-
-			err = datablock_manager.release_data_block(indirect_buf[blk_off]);
-
-			if (err < 0) {
-				if (should_deleted) delete finode;
-				if (indirect_buf != nullptr) free(indirect_buf);
-
-				return err;
-			}
-		}
-	}
-
-	if (indirect_buf != nullptr) free(indirect_buf);
-
-	// TODO: should do truncate in two cases (in direct and in indirect region)
-
-	// Update size
-	finode->inode.size = size;
-
-	// Update time
-	finode->inode.atime = Utilities::now();
-	finode->inode.mtime = Utilities::now();
-
-	err = finode->save();
+	err = truncate_file(*finode, size);
 
 	if (err < 0) {
 		if (should_deleted) delete finode;
-		
+
 		return err;
 	}
 
@@ -1936,7 +1958,7 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 			if (!owner_or_root) {
 				if (should_deleted) delete finode;
 				
-				return -EACCES;
+				return -EPERM;
 			}
 
 			

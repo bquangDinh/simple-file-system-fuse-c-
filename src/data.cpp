@@ -98,8 +98,6 @@ error_t DataBlockManager::get_available_blk(blk_t& out) {
 
                 DBG("Set bit (%u) in the bitmap", j - i * num_bits_per_block);
 
-                Utilities::print_bitmap_bits(bitmap, 10);
-
                 // Update bitmap
                 err = storage.block_write(offset + i, bitmap);
 
