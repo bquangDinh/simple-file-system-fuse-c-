@@ -6,6 +6,9 @@
 #include "utilities.hpp"
 
 error_t SuperblockManager::save() {
+    // Acquire write lock
+    std::unique_lock<std::shared_mutex> lock(superblock_lock);
+    
     return storage.block_write(SUPERBLOCK_BLK_NUM, &_superblock);
 }
 
@@ -61,79 +64,117 @@ error_t SuperblockManager::init() {
     return save();
 }
 
-uint32_t SuperblockManager::get_max_inum() const {
+uint32_t SuperblockManager::get_max_inum() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.max_inum;
 }
 
-uint32_t SuperblockManager::get_max_dnum() const {
+uint32_t SuperblockManager::get_max_dnum() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.max_dnum;
 }
 
-uint32_t SuperblockManager::get_ino_bm_start_blk() const {
+uint32_t SuperblockManager::get_ino_bm_start_blk() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.i_bitmap_blk;
 }
 
-uint32_t SuperblockManager::get_ino_bm_end_blk() const {
+uint32_t SuperblockManager::get_ino_bm_end_blk() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.d_bitmap_blk - 1;
 }
 
-uint32_t SuperblockManager::get_data_bm_start_blk() const {
+uint32_t SuperblockManager::get_data_bm_start_blk() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.d_bitmap_blk;
 }
 
-uint32_t SuperblockManager::get_data_bm_end_blk() const {
+uint32_t SuperblockManager::get_data_bm_end_blk() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.i_start_blk - 1;
 }
 
-uint32_t SuperblockManager::get_ino_region_start_blk() const {
+uint32_t SuperblockManager::get_ino_region_start_blk() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.i_start_blk;
 }
 
-uint32_t SuperblockManager::get_ino_region_end_blk() const {
+uint32_t SuperblockManager::get_ino_region_end_blk() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.d_start_blk - 1;
 }
 
-uint32_t SuperblockManager::get_data_region_start_blk() const {
+uint32_t SuperblockManager::get_data_region_start_blk() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.d_start_blk;
 }
 
-uint32_t SuperblockManager::get_data_region_end_blk() const {
+uint32_t SuperblockManager::get_data_region_end_blk() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.d_start_blk + _superblock.max_dnum - 1;
 }
 
-uint32_t SuperblockManager::get_free_data_blk_count() const {
+uint32_t SuperblockManager::get_free_data_blk_count() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.free_blk_count;
 }
 
-uint32_t SuperblockManager::get_free_ino_count() const {
+uint32_t SuperblockManager::get_free_ino_count() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.free_ino_count;
 }
 
-uint16_t SuperblockManager::get_ino_bitmap_blks() const {
+uint16_t SuperblockManager::get_ino_bitmap_blks() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.d_bitmap_blk - _superblock.i_bitmap_blk;
 }
 
-uint16_t SuperblockManager::get_data_bitmap_blks() const {
+uint16_t SuperblockManager::get_data_bitmap_blks() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.i_start_blk - _superblock.d_bitmap_blk;
 }
 
-uint16_t SuperblockManager::get_magic_num() const {
+uint16_t SuperblockManager::get_magic_num() {
+    // Acquire read lock
+    std::shared_lock<std::shared_mutex> lock(superblock_lock);
     return _superblock.magic_num;
 }
 
 void SuperblockManager::increase_free_data_blk_count() {
+    // Acquire write lock
+    std::unique_lock<std::shared_mutex> lock(superblock_lock);
     _superblock.free_blk_count++;
 }
 
 void SuperblockManager::decrease_free_data_blk_count() {
+    // Acquire write lock
+    std::unique_lock<std::shared_mutex> lock(superblock_lock);
     _superblock.free_blk_count--;
 }
 
 void SuperblockManager::increase_free_ino_count() {
+    // Acquire write lock
+    std::unique_lock<std::shared_mutex> lock(superblock_lock);
     _superblock.free_ino_count++;
 }
 
 void SuperblockManager::decrease_free_ino_count() {
+    // Acquire write lock
+    std::unique_lock<std::shared_mutex> lock(superblock_lock);
     _superblock.free_ino_count--;
 }
 

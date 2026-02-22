@@ -24,8 +24,6 @@ private:
     StorageManager& operator=(const StorageManager&) = delete;
 
     bool is_opened();
-
-    std::shared_mutex& get_lock_for_blk(blk_t blk_num);
 public:
     static const uint32_t DISK_SIZE = 32 * 1024 * 1024;
     static const uint32_t BLOCK_SIZE = 4096;
@@ -39,6 +37,8 @@ public:
 
     error_t init(const char* diskfile_path);
 
+    std::shared_mutex& get_lock_for_blk(blk_t blk_num);
+
     error_t storage_fsync();
 
     error_t storage_close();
@@ -46,5 +46,9 @@ public:
     error_t block_read(const blk_t block_num, void* buf);
 
     error_t block_write(const blk_t block_num, const void* buf);
+
+    error_t block_read_not_locked(const blk_t block_num, void* buf);
+
+    error_t block_write_not_locked(const blk_t block_num, const void* buf);
 };
 

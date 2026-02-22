@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <shared_mutex>
 
 #include "myfs/block.hpp"
 
@@ -29,6 +30,8 @@ struct superblock {
 
 class SuperblockManager {
 private:
+    std::shared_mutex superblock_lock;
+
     StorageManager& storage;
 
     SuperblockManager() : storage(StorageManager::instance()) {}
@@ -54,29 +57,29 @@ public:
     error_t save();
 
     // Getters
-    uint32_t get_max_inum() const;
-    uint32_t get_max_dnum() const;
+    uint32_t get_max_inum();
+    uint32_t get_max_dnum();
 
-    uint32_t get_ino_bm_start_blk() const;
-    uint32_t get_ino_bm_end_blk() const;
+    uint32_t get_ino_bm_start_blk();
+    uint32_t get_ino_bm_end_blk();
 
-    uint32_t get_data_bm_start_blk() const;
-    uint32_t get_data_bm_end_blk() const;
+    uint32_t get_data_bm_start_blk();
+    uint32_t get_data_bm_end_blk();
 
-    uint32_t get_ino_region_start_blk() const;
-    uint32_t get_ino_region_end_blk() const;
+    uint32_t get_ino_region_start_blk();
+    uint32_t get_ino_region_end_blk();
 
-    uint32_t get_data_region_start_blk() const;
-    uint32_t get_data_region_end_blk() const;
+    uint32_t get_data_region_start_blk();
+    uint32_t get_data_region_end_blk();
 
-    uint32_t get_free_data_blk_count() const;
-    uint32_t get_free_ino_count() const;
+    uint32_t get_free_data_blk_count();
+    uint32_t get_free_ino_count();
 
-    uint16_t get_magic_num() const;
+    uint16_t get_magic_num();
 
-    uint16_t get_ino_bitmap_blks() const;
+    uint16_t get_ino_bitmap_blks();
 
-    uint16_t get_data_bitmap_blks() const;
+    uint16_t get_data_bitmap_blks();
 
     // Setters
     void increase_free_data_blk_count();

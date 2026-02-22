@@ -11,6 +11,7 @@
 #include "myfs/dirent.hpp"
 #include "utilities.hpp"
 
+extern FILE* thread_log_fd;
 
 /* --------------- Inode class ------------------ */
 Inode::Inode()
@@ -397,6 +398,13 @@ error_t InodeManager::init_root() {
 
     assert(root_ino == ROOT_INO);
 
+    Utilities::Mutex::TrackedUniqueLock root_lock(
+        get_inode_lock(ROOT_INO),
+        get_inode_lock_idx(ROOT_INO),
+        thread_log_fd,
+        "inode-init:root:write"
+    );
+
     fuse_context* ctx = fuse_get_context();
 
     assert(ctx != nullptr);
@@ -446,11 +454,16 @@ error_t InodeManager::init() {
     return 0;
 }
 
+std::shared_mutex& InodeManager::get_inode_lock(ino_t ino) {
+    return inode_locks[ino % NUM_INODE_LOCKS];
+}
+
 error_t InodeManager::get_available_ino(ino_t& out) {
     SuperblockManager& superblock = SuperblockManager::instance();
     StorageManager& storage = StorageManager::instance();
 
-    std::lock_guard<std::mutex> lock(inode_bitmap_lock);
+    // Acquire write lock on bitmap
+    std::unique_lock<std::shared_mutex> lock(inode_bitmap_lock);
 
     uint16_t inode_bitmap_blocks = superblock.get_ino_bitmap_blks();
 
@@ -506,6 +519,8 @@ error_t InodeManager::get_available_ino(ino_t& out) {
                 // Ino always start at 1
                 out = j + 1;
 
+                DBG("available ino: %ld", out);
+
                 return 0;
             }
         }
@@ -520,15 +535,27 @@ error_t InodeManager::release_ino(ino_t ino) {
     SuperblockManager& superblock = SuperblockManager::instance();
     StorageManager& storage = StorageManager::instance();
 
-    assert(ino < superblock.get_max_inum());
+    assert(ino > 0 && ino < superblock.get_max_inum());
 
-    std::lock_guard<std::mutex> lock(inode_bitmap_lock);
+    // Make sure ino lock is held before entering this function
+    assert(Utilities::Mutex::DebugLockTracker::is_held(ino % InodeManager::NUM_INODE_LOCKS));
+
+    // Since we offset 1 for inode (inode starts at 1)
+    // When we release, we have to subtract by 1 to get the correct inode
+    ino_t freed_ino = ino - 1;
+
+    DBG("ino %ld released", freed_ino);
+
+    // Acquire write lock on bitmap
+    std::unique_lock<std::shared_mutex> lock(inode_bitmap_lock);
+
+    DBG("Acquired ino bitmap lock");
 
     uint32_t num_bits_per_block = storage.BLOCK_SIZE * 8;
 
-    blk_t blk = superblock.get_ino_bm_start_blk() + (ino / num_bits_per_block);
+    blk_t blk = superblock.get_ino_bm_start_blk() + (freed_ino / num_bits_per_block);
 
-    uint32_t bit_idx = ino % num_bits_per_block;
+    uint32_t bit_idx = freed_ino % num_bits_per_block;
 
     bitmap_t bitmap = (bitmap_t)malloc(storage.BLOCK_SIZE);
 
@@ -544,6 +571,8 @@ error_t InodeManager::release_ino(ino_t ino) {
 
     Utilities::BitmapOps::unset_bitmap(bitmap, bit_idx);
 
+    DBG("Unset bit %u on the bitmap", bit_idx);
+
     err = storage.block_write(blk, bitmap);
 
     free(bitmap);
@@ -556,6 +585,8 @@ error_t InodeManager::release_ino(ino_t ino) {
 
     err = superblock.save();
 
+    DBG("Done.");
+
     if (err < 0) return err;
 
     return 0;
@@ -566,6 +597,9 @@ error_t InodeManager::get_inode(ino_t ino, Inode& out) {
     StorageManager& storage = StorageManager::instance();
 
     assert(ino < superblock.get_max_dnum());
+
+    // Make sure ino lock is held before entering this function
+    assert(Utilities::Mutex::DebugLockTracker::is_held(ino % InodeManager::NUM_INODE_LOCKS));
 
     uint32_t inodes_per_block = storage.BLOCK_SIZE / sizeof(inode_t);
     uint32_t blk_idx = ino / inodes_per_block;
@@ -608,7 +642,18 @@ error_t InodeManager::get_inode_from_path(const char* path, ino_t start, Inode& 
     if (strlen(base) > NAME_MAX) return -ENAMETOOLONG;
 
     Inode current;
+
     dirent_t dir_entry = { 0 };
+
+    // Lock start ino
+    size_t idx = start % NUM_INODE_LOCKS;
+
+	Utilities::Mutex::TrackedSharedLock current_lock(
+		get_inode_lock(start),
+		get_inode_lock_idx(start),
+        thread_log_fd,
+        "get_inode_from_path:current"
+	);
 
     error_t err = get_inode(start, current);
 
@@ -674,8 +719,20 @@ error_t InodeManager::get_inode_from_path(const char* path, ino_t start, Inode& 
             return err;
         }
 
+        // Lock dir entry
+        idx = dir_entry.ino % NUM_INODE_LOCKS;
+
+        Utilities::Mutex::TrackedSharedLock next_lock(
+            get_inode_lock(dir_entry.ino),
+            get_inode_lock_idx(dir_entry.ino),
+            thread_log_fd,
+            "get_inode_from_path:next"
+        );
+
         // Advance current to the next
-        err = get_inode(dir_entry.ino, current);
+        Inode next;
+
+        err = get_inode(dir_entry.ino, next);
 
         if (err < 0) {
             free(path_clone);
@@ -684,6 +741,9 @@ error_t InodeManager::get_inode_from_path(const char* path, ino_t start, Inode& 
 
             return err;
         }
+
+        current_lock = std::move(next_lock);
+        current = std::move(next);
 
         // Consider the next token
         token = strtok_r(nullptr, "/", &save_ptr);
@@ -696,5 +756,144 @@ error_t InodeManager::get_inode_from_path(const char* path, ino_t start, Inode& 
 	Utilities::free_path_split(&p);
 
     return 0;
+}
+
+error_t InodeManager::get_inode_from_path_locked(const char* path, ino_t start, Inode& out, Utilities::Mutex::TrackedSharedLock& out_lock) {
+    SuperblockManager& superblock = SuperblockManager::instance();
+    StorageManager& storage = StorageManager::instance();
+    DirentManager& dirent_manager = DirentManager::instance();
+
+    assert(path != nullptr);
+    assert(start < superblock.get_max_inum());
+
+    Utilities::path_split p = { 0 };
+
+    if (Utilities::split_path(path, &p) < 0) return -ENOMEM;
+
+    char* base = p.base;
+
+    if (strlen(base) > NAME_MAX) return -ENAMETOOLONG;
+
+    Inode current;
+
+    dirent_t dir_entry = { 0 };
+
+    // Lock start ino
+    size_t idx = start % NUM_INODE_LOCKS;
+
+	Utilities::Mutex::TrackedSharedLock current_lock(
+		get_inode_lock(start),
+		get_inode_lock_idx(start),
+        thread_log_fd,
+        "get_inode_from_path:current"
+	);
+
+    error_t err = get_inode(start, current);
+
+    if (err < 0) {
+        Utilities::free_path_split(&p);
+
+        return err;
+    }
+
+    char* path_clone = strdup(path);
+
+	if (path_clone == nullptr) {
+		Utilities::free_path_split(&p);
+
+		return -ENOMEM;
+	}
+
+    char* save_ptr;
+    char* token = strtok_r(path_clone, "/", &save_ptr);
+    size_t token_len = 0;
+
+    while (token) {
+        if (strcmp(token, base) != 0) {
+            // Mean we are still in the middle of traversing
+			// Check if the current token is a dir
+			// Cannot traverse a file
+            if (!current.is_dir()) {
+                free(path_clone);
+
+                Utilities::free_path_split(&p);
+
+                return -ENOTDIR;
+            }
+        }
+
+        token_len = strlen(token);
+
+		// Check if current has "execute" bit
+        if (!current.can_execute()) {
+            free(path_clone);
+
+            Utilities::free_path_split(&p);
+
+            return -EACCES;
+        }
+
+        if (token_len > NAME_MAX) {
+            free(path_clone);
+
+            Utilities::free_path_split(&p);
+
+            return -ENAMETOOLONG;
+        }
+
+		// Check if the token exists in the current dir
+        err = dirent_manager.dir_find(current.inode.ino, token, &dir_entry);
+
+        if (err < 0) {
+            free(path_clone);
+
+            Utilities::free_path_split(&p);
+
+            return err;
+        }
+
+        // Lock dir entry
+        idx = dir_entry.ino % NUM_INODE_LOCKS;
+
+        Utilities::Mutex::TrackedSharedLock next_lock(
+            get_inode_lock(dir_entry.ino),
+            get_inode_lock_idx(dir_entry.ino),
+            thread_log_fd,
+            "get_inode_from_path:next"
+        );
+
+        // Advance current to the next
+        Inode next;
+
+        err = get_inode(dir_entry.ino, next);
+
+        if (err < 0) {
+            free(path_clone);
+
+            Utilities::free_path_split(&p);
+
+            return err;
+        }
+
+        current_lock = std::move(next_lock);
+        current = std::move(next);
+
+        // Consider the next token
+        token = strtok_r(nullptr, "/", &save_ptr);
+    }
+
+    out = current;
+
+    out_lock = std::move(current_lock);
+
+    free(path_clone);
+
+	Utilities::free_path_split(&p);
+
+    return 0;
+}
+
+size_t InodeManager::get_inode_lock_idx(ino_t ino) {
+    return ino % NUM_INODE_LOCKS;
 }
 /* ---------------------------------------------- */

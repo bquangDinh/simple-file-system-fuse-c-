@@ -9,6 +9,7 @@
 #include "block.hpp"
 #include "superblock.hpp"
 #include "data.hpp"
+#include "utilities.hpp"
 
 #define DIRECT_PTRS_COUNT 12
 #define IS_DATA_BLK_ALLOCATED(blk) blk != 0
@@ -95,9 +96,12 @@ public:
 };
 
 class InodeManager {
+public:
+    static constexpr size_t NUM_INODE_LOCKS = 1024;
+    std::shared_mutex inode_locks[InodeManager::NUM_INODE_LOCKS];
 private:
-    std::mutex inode_bitmap_lock;
-
+    std::shared_mutex inode_bitmap_lock;
+    
     InodeManager() {}
 
     ~InodeManager() = default;
@@ -111,7 +115,7 @@ private:
     error_t init_root();
 public:
     Inode* root = nullptr;
-
+    
     static InodeManager& instance () {
         static InodeManager instance;
 
@@ -127,5 +131,11 @@ public:
     error_t get_inode(ino_t ino, Inode& out);
 
     error_t get_inode_from_path(const char* path, ino_t start, Inode& out);
+
+    error_t get_inode_from_path_locked(const char* path, ino_t start, Inode& out, Utilities::Mutex::TrackedSharedLock& lock);
+
+    std::shared_mutex& get_inode_lock(ino_t ino);
+
+    size_t get_inode_lock_idx(ino_t ino);
 };
 

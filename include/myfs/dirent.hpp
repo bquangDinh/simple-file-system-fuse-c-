@@ -13,6 +13,8 @@ struct dirent_t {
 
 class DirentManager {
 private:
+    std::shared_mutex dir_lock;
+    
     DirentManager() {}
 
     ~DirentManager() = default;

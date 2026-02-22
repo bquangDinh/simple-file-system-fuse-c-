@@ -4,6 +4,9 @@
 #include <sys/types.h>
 #include <cstdarg>
 #include <cstdio>
+#include <unordered_set>
+#include <mutex>
+#include <shared_mutex>
 
 #define DEBUG
 
@@ -29,8 +32,10 @@
 #define IS_STR_EMPTY(str) (strcmp(str, "") == 0)
 
 typedef unsigned char* bitmap_t;
+extern thread_local std::unordered_set<size_t> held_lock_idx;
 
 namespace Utilities {
+
     struct path_split {
         char *buf;
         char *dir;
@@ -78,5 +83,71 @@ namespace Utilities {
         mode_t get_group_perm(mode_t mode);
 
         mode_t get_other_perm(mode_t mode);
+    }
+
+    namespace Mutex {
+        struct DebugLockTracker {
+            static void on_lock(size_t idx) { held_lock_idx.insert(idx); }
+            static void on_unlock(size_t idx) { held_lock_idx.erase(idx); }
+            static bool is_held(size_t idx) { return held_lock_idx.count(idx) > 0; }
+        };
+
+        class TrackedUniqueLock {
+            public:
+                TrackedUniqueLock() = default;
+
+                TrackedUniqueLock(std::shared_mutex& mtx, size_t idx, bool defer = false);
+
+                TrackedUniqueLock(std::shared_mutex& mtx, size_t idx, FILE* log, const char* op, bool defer = false);
+
+                ~TrackedUniqueLock();
+
+                TrackedUniqueLock& operator=(TrackedUniqueLock&& other) noexcept;
+
+                TrackedUniqueLock(TrackedUniqueLock&& other) noexcept;
+
+                void lock();
+
+                void unlock();
+
+                // Check if the lock currently owns the mutex
+                bool owns_lock();
+            private:
+                std::unique_lock<std::shared_mutex> _lock;
+                size_t _idx = 0;
+                bool _defer = false;
+                FILE* _log = nullptr;
+                const char* _op = nullptr;
+        };
+
+        class TrackedSharedLock {
+            public:
+                TrackedSharedLock() = default;
+
+                TrackedSharedLock(std::shared_mutex& mtx, size_t idx, bool defer = false);
+
+                TrackedSharedLock(std::shared_mutex& mtx, size_t idx, FILE* log, const char* op, bool defer = false);
+
+                TrackedSharedLock(TrackedSharedLock&& other) noexcept;
+
+                ~TrackedSharedLock();
+
+                TrackedSharedLock& operator=(TrackedSharedLock&& other) noexcept;
+
+                void lock();
+
+                void unlock();
+
+                // Check if the lock currently owns the mutex
+                bool owns_lock();
+
+                void change_op(const char* op);
+            private:
+                std::shared_lock<std::shared_mutex> _lock;
+                size_t _idx = 0;
+                bool _defer = false;
+                FILE* _log = nullptr;
+                const char* _op = nullptr;
+        };
     }
 }

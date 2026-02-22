@@ -28,24 +28,22 @@
 #define ACCMODE_REQUEST_WRITE(acc_mode) ((acc_mode) == O_WRONLY || (acc_mode) == O_RDWR)
 
 /* Locks */
-#define MAX_INODE_LOCKS 1024
-std::shared_mutex inode_rw_locks[MAX_INODE_LOCKS];
 FILE* thread_log_fd = nullptr;
 const char* THREAD_LOG_FILE = "/home/myfs-thread.log";
 
-#define RD_LOCK(m) do { \
-	fprintf(thread_log_fd == nullptr ? stdout : thread_log_fd, "[%s] RD LOCK %s %p thread_id=%lu at %s:%d\n", \
-	__func__, #m, static_cast<void*>(std::addressof((m))), (unsigned long)pthread_self(), __FILE__, __LINE__); \
-	fflush(thread_log_fd == nullptr ? stdout : thread_log_fd); \
-	std::shared_lock<std::shared_mutex> lock(m); \
-} while (0)
+// #define RD_LOCK(m) do { \
+// 	fprintf(thread_log_fd == nullptr ? stdout : thread_log_fd, "[%s] RD LOCK %s %p thread_id=%lu at %s:%d\n", \
+// 	__func__, #m, static_cast<void*>(std::addressof((m))), (unsigned long)pthread_self(), __FILE__, __LINE__); \
+// 	fflush(thread_log_fd == nullptr ? stdout : thread_log_fd); \
+// 	std::shared_lock<std::shared_mutex> lock(m); \
+// } while (0)
 
-#define WR_LOCK(m) do { \
-	fprintf(thread_log_fd == nullptr ? stdout : thread_log_fd, "[%s] WR LOCK %s %p thread_id=%lu at %s:%d\n", \
-	__func__, #m, static_cast<void*>(std::addressof((m))), (unsigned long)pthread_self(), __FILE__, __LINE__); \
-	fflush(thread_log_fd == nullptr ? stdout : thread_log_fd); \
-	std::unique_lock<std::shared_mutex> lock(m); \
-} while (0)
+// #define WR_LOCK(m) do { \
+// 	fprintf(thread_log_fd == nullptr ? stdout : thread_log_fd, "[%s] WR LOCK %s %p thread_id=%lu at %s:%d\n", \
+// 	__func__, #m, static_cast<void*>(std::addressof((m))), (unsigned long)pthread_self(), __FILE__, __LINE__); \
+// 	fflush(thread_log_fd == nullptr ? stdout : thread_log_fd); \
+// 	std::unique_lock<std::shared_mutex> lock(m); \
+// } while (0)
 
 struct file_handler {
 	Inode* inode;
@@ -91,9 +89,9 @@ error_t thread_fd_close() {
 }
 
 /* Lock Ops */
-std::shared_mutex& get_lock_for_inode(ino_t ino) {
-	return inode_rw_locks[ino % MAX_INODE_LOCKS];
-}
+// std::shared_mutex& inode_manager.get_inode_lock(ino_t ino) {
+// 	return inode_rw_locks[ino % MAX_INODE_LOCKS];
+// }
 
 /* FUSE Helper Funcs */
 uid_t get_context_uid() {
@@ -148,14 +146,21 @@ error_t make_file(const char* path, mode_t mode, Inode& out) {
 
 	error_t err = inode_manager.get_inode_from_path(dir, ROOT_INO, parent_inode);
 
+	// Acquire write lock on parent inode because we're about to add an entry to parent
+	Utilities::Mutex::TrackedUniqueLock parent_write_lock(
+		inode_manager.get_inode_lock(parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(parent_inode.get_ino()),
+		thread_log_fd,
+		"make_file:parent_inode:write"
+	);
+
+	DBG("Acquired lock on parent inode: %ld", parent_inode.get_ino());
+
 	if (err < 0) {
 		Utilities::free_path_split(&ps);
 
 		return err;
 	}
-
-	// Acquire write lock on parent inode because we're about to add an entry to parent
-	WR_LOCK(get_lock_for_inode(parent_inode.get_ino()));
 
 	if (!parent_inode.is_valid()) {
 		Utilities::free_path_split(&ps);
@@ -191,6 +196,12 @@ error_t make_file(const char* path, mode_t mode, Inode& out) {
 
 	err = inode_manager.get_available_ino(new_ino);
 
+	DBG("New ino is %ld", new_ino);
+
+	if (new_ino == parent_inode.get_ino()) {
+		DBG("[ALERT] new ino = parent ino | path: %s", path);
+	}
+
 	if (err < 0) {
 		Utilities::free_path_split(&ps);
 
@@ -200,7 +211,12 @@ error_t make_file(const char* path, mode_t mode, Inode& out) {
 	DBG("New ino is %ld", new_ino);
 
 	// Acquire write lock on this new file inode
-	WR_LOCK(get_lock_for_inode(new_ino));
+	Utilities::Mutex::TrackedUniqueLock new_inode_lock(
+		inode_manager.get_inode_lock(new_ino),
+		inode_manager.get_inode_lock_idx(new_ino),
+		thread_log_fd,
+		"make_file:new_ino"
+	);
 
 	if (S_ISFIFO(mode)) {
 		out = Inode{new_ino, S_IFIFO | (mode & 07777), 1, uid, gid};
@@ -243,6 +259,9 @@ error_t make_file(const char* path, mode_t mode, Inode& out) {
 		return err;
 	}
 
+	// Force sync
+	storage.storage_fsync();
+
 	Utilities::free_path_split(&ps);
 
 	DBG("Added entry to parent inode");
@@ -256,6 +275,8 @@ error_t read_file(Inode& finode, char* buffer, size_t size, off_t offset) {
 	if (finode.is_dir()) return -EISDIR;
 
 	if (!finode.is_valid()) return -EINVAL;
+
+	assert(Utilities::Mutex::DebugLockTracker::is_held(finode.get_ino()));
 
 	size_t bytes_read = 0;
 	off_t current_offset = offset;
@@ -347,6 +368,8 @@ error_t write_file(Inode& finode, const char* buffer, size_t size, off_t offset)
 	if (finode.is_dir()) return -EISDIR;
 
 	if (!finode.is_valid()) return -EINVAL;
+
+	assert(Utilities::Mutex::DebugLockTracker::is_held(finode.get_ino()));
 
 	size_t bytes_written = 0;
 	off_t current_offset = offset;
@@ -513,8 +536,7 @@ error_t write_file(Inode& finode, const char* buffer, size_t size, off_t offset)
 error_t truncate_file(Inode& finode, off_t size) {
 	error_t err;
 
-	// Acquire write lock on finode
-	WR_LOCK(get_lock_for_inode(finode.get_ino()));
+	assert(Utilities::Mutex::DebugLockTracker::is_held(finode.get_ino()));
 
 	// Check if inode is a directory
 	if (finode.is_dir()) {
@@ -632,6 +654,7 @@ error_t truncate_file(Inode& finode, off_t size) {
 
 	return 0;
 }
+
 /* --------------- FUSE OPERATIONS ------------------------ */
 static void* myfs_init(struct fuse_conn_info *conn, struct fuse_config* fconfig) {
     assert(diskfile_path != nullptr);
@@ -723,7 +746,12 @@ static int myfs_getattr(const char* path, struct stat *st_buf, struct fuse_file_
 	DBG("Inode is: %ld - nlink = %u - opencount = %u", finode.get_ino(), finode.inode.nlink, finode.inode.open_count);
 
 	// Acquire read lock
-	RD_LOCK(get_lock_for_inode(finode.get_ino()));
+	Utilities::Mutex::TrackedSharedLock finode_lock(
+		inode_manager.get_inode_lock(finode.get_ino()),
+		inode_manager.get_inode_lock_idx(finode.get_ino()),
+		thread_log_fd,
+		"myfs_getattr:finode"
+	);
 
 	if (!finode.is_valid()) {
 		return -ENOENT;
@@ -754,7 +782,12 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 	if (err < 0) return err;
 
 	// Acquire read lock
-	RD_LOCK(get_lock_for_inode(dir_inode->get_ino()));
+	Utilities::Mutex::TrackedUniqueLock dir_lock(
+		inode_manager.get_inode_lock(dir_inode->get_ino()),
+		inode_manager.get_inode_lock_idx(dir_inode->get_ino()),
+		thread_log_fd,
+		"myfs_opendir:dir_inode:write"
+	);
 
 	if (!dir_inode->is_valid()) return -ENOENT;
 
@@ -763,12 +796,19 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 	int need_read = ACCMODE_REQUEST_READ(access_mode);
 	int need_write = ACCMODE_REQUEST_WRITE(access_mode);
 
-	DBG("file: %s | need_read %d (can: %d) | need_write %d (can: %d)", path, need_read, dir_inode->can_read(), need_write, dir_inode->can_write());
-
 	// Check permission bit
 	if (need_read && !dir_inode->can_read()) return -EACCES;
 
 	if (need_write && !dir_inode->can_write()) return -EACCES;
+
+	// dir_lock.unlock();
+
+	// Utilities::Mutex::TrackedUniqueLock dir_write_lock(
+	// 	inode_manager.get_inode_lock(dir_inode->get_ino()),
+	// 	inode_manager.get_inode_lock_idx(dir_inode->get_ino()),
+	// 	thread_log_fd,
+	// 	"myfs_opendir:dir_inode:write"
+	// );	
 
 	dir_inode->inode.open_count++;
 
@@ -806,7 +846,12 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 	Inode* dir_inode = fh->inode;
 
 	// Acquire read lock
-	RD_LOCK(get_lock_for_inode(dir_inode->get_ino()));
+	Utilities::Mutex::TrackedSharedLock dir_lock(
+		inode_manager.get_inode_lock(dir_inode->get_ino()),
+		inode_manager.get_inode_lock_idx(dir_inode->get_ino()),
+		thread_log_fd,
+		"myfs_readdir:dir_inode"
+	);
 
 	if (!dir_inode->is_valid()) {
 		dir_inode = nullptr;
@@ -894,8 +939,13 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 		return err;
 	}
 
-	// Acquire write lock on parent inode
-	WR_LOCK(get_lock_for_inode(parent_inode.get_ino()));
+	// Acquire read lock on parent inode
+	Utilities::Mutex::TrackedSharedLock parent_read_lock(
+		inode_manager.get_inode_lock(parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(parent_inode.get_ino()),
+		thread_log_fd,
+		"myfs_mkdir:parent_inode:read"
+	);
 
 	if (!parent_inode.is_valid()) {
 		Utilities::free_path_split(&ps);
@@ -935,7 +985,12 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	}
 
 	// Acquire lock on this new directory to write
-	WR_LOCK(get_lock_for_inode(new_ino));
+	Utilities::Mutex::TrackedUniqueLock new_ino_lock(
+		inode_manager.get_inode_lock(new_ino),
+		inode_manager.get_inode_lock_idx(new_ino),
+		thread_log_fd,
+		"myfs_mkdir:new_ino"
+	);
 
 	DBG("Create new directory inode with ino: %ld", new_ino);
 
@@ -972,6 +1027,24 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 
 	DBG("Added '..' entry (%ld) to new dir inode: %ld", parent_inode.get_ino(), new_ino);
 
+	parent_read_lock.unlock();
+
+	new_ino_lock.unlock();
+
+	Utilities::Mutex::TrackedSharedLock new_ino_lock_read(
+		inode_manager.get_inode_lock(new_ino),
+		inode_manager.get_inode_lock_idx(new_ino),
+		thread_log_fd,
+		"myfs_mkdir:new_ino:read"
+	);
+
+	Utilities::Mutex::TrackedUniqueLock parent_write_lock(
+		inode_manager.get_inode_lock(parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(parent_inode.get_ino()),
+		thread_log_fd,
+		"myfs_mkdir:parent_inode:write"
+	);
+
 	err = dirent_manager.dir_add(parent_inode, new_dir_inode, base);
 
 	if (err < 0) {
@@ -994,6 +1067,8 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	}
 
 	DBG("Updated nlink of parent inode (%ld) to nlink = %u", parent_inode.get_ino(), parent_inode.inode.nlink);
+
+	storage.storage_fsync();
 
 	Utilities::free_path_split(&ps);
 
@@ -1044,7 +1119,12 @@ static int myfs_open(const char* path, struct fuse_file_info *fi) {
 	if (err < 0) return err;
 
 	// Acquire write lock on this finode because we change its opencount
-	WR_LOCK(get_lock_for_inode(finode->get_ino()));
+	Utilities::Mutex::TrackedUniqueLock finode_lock(
+		inode_manager.get_inode_lock(finode->get_ino()),
+		inode_manager.get_inode_lock_idx(finode->get_ino()),
+		thread_log_fd,
+		"myfs_open:finode"
+	);
 
 	if (!finode->is_valid()) {
 		delete finode;
@@ -1137,8 +1217,13 @@ static int myfs_read(const char* path, char* buffer, size_t size, off_t offset, 
 	assert(finode != nullptr);
 
 	// Acquire write lock on this file inode
-	WR_LOCK(get_lock_for_inode(finode->get_ino()));
-	
+	Utilities::Mutex::TrackedUniqueLock finode_lock(
+		inode_manager.get_inode_lock(finode->get_ino()),
+		inode_manager.get_inode_lock_idx(finode->get_ino()),
+		thread_log_fd,
+		"myfs_read:finode"
+	);
+
 	if (!finode->is_valid()) {
 		finode = nullptr;
 
@@ -1182,8 +1267,13 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 	assert(finode != nullptr);
 
 	// Acquire read lock on this file inode
-	WR_LOCK(get_lock_for_inode(finode->get_ino()));
-	
+	Utilities::Mutex::TrackedUniqueLock finode_lock(
+		inode_manager.get_inode_lock(finode->get_ino()),
+		inode_manager.get_inode_lock_idx(finode->get_ino()),
+		thread_log_fd,
+		"myfs_write:finode"
+	);
+
 	if (!finode->is_valid()) {
 		finode = nullptr;
 
@@ -1222,6 +1312,8 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 		}
 	}
 
+	storage.storage_fsync();
+
 	DBG("Bytes written: %zu", res);
 
 	DBG("Done.");
@@ -1256,6 +1348,9 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 	char* target_dir = target_ps.dir;
 	char* target_base = target_ps.base;
 
+	bool same_parent = false;
+	bool same_source_target = false;
+
 	if (IS_STR_EMPTY(source_base) || IS_STR_EMPTY(target_base)) {
 		Utilities::free_path_split(&source_ps);
 		Utilities::free_path_split(&target_ps);
@@ -1280,8 +1375,13 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 		return err;
 	}
 
-	// Obtain write lock on working inodes
-	WR_LOCK(get_lock_for_inode(source_parent_inode.get_ino()));
+	// Obtain read lock first
+	Utilities::Mutex::TrackedSharedLock source_parent_lock(
+		inode_manager.get_inode_lock(source_parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(source_parent_inode.get_ino()),
+		thread_log_fd,
+		"myfs_rename:source_parent:read"
+	);
 
 	// Check if source parent is a valid directory
 	if (!source_parent_inode.is_dir() || !source_parent_inode.is_valid()) {
@@ -1300,12 +1400,12 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 		return err;
 	}
 
-	// In case of two parents are the same (mv within the same directory)
-	// Having another lock on target directory will introduce deadlock
-	// So, only lock when two parent inodes are different
-	if (target_parent_inode.get_ino() != source_parent_inode.get_ino()) {
-		WR_LOCK(get_lock_for_inode(target_parent_inode.get_ino()));
-	}
+	Utilities::Mutex::TrackedSharedLock target_parent_lock(
+		inode_manager.get_inode_lock(target_parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(target_parent_inode.get_ino()),
+		thread_log_fd,
+		"myfs_rename:target_parent_inode:read"
+	);
 
 	// Check if the target parent is a valid directory
 	if (!target_parent_inode.is_dir() || !target_parent_inode.is_valid()) {
@@ -1314,6 +1414,8 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 
 		return -ENOTDIR;
 	}
+
+	same_parent = target_parent_inode.get_ino() == source_parent_inode.get_ino();
 
 	// Check permissions
 	// Since we want to write into source parent inode, thus we need write and execute permissions
@@ -1342,6 +1444,16 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 		return err;
 	} 
 
+	// Acquire read lock on source inode
+	Utilities::Mutex::TrackedSharedLock source_lock(
+		inode_manager.get_inode_lock(source_entry.ino),
+		inode_manager.get_inode_lock_idx(source_entry.ino),
+		thread_log_fd,
+		"myfs_rename:source_entry:read"
+	);
+
+	Utilities::Mutex::TrackedSharedLock target_lock;
+
 	// Obtain source inode
 	err = inode_manager.get_inode(source_entry.ino, source_inode);
 
@@ -1351,9 +1463,6 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 
 		return err;
 	}
-
-	// Acquire write lock on source inode
-	WR_LOCK(get_lock_for_inode(source_inode.get_ino()));
 
 	if (source_parent_inode.is_dir_sticky()) {
 		if (
@@ -1389,13 +1498,12 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 	if (target_already_exist) {
 		assert(target_entry.ino != 0);
 
-		// Obtain lock on target
-		// Since it could be possible that source inode and target inode are the same
-		// maybe target inode is a hard link to source inode
-		// obtain the same lock twice will possibly introduce deadlock
-		if (target_entry.ino != source_inode.get_ino()) {
-			WR_LOCK(get_lock_for_inode(target_entry.ino));
-		}
+		target_lock = Utilities::Mutex::TrackedSharedLock(
+			inode_manager.get_inode_lock(target_entry.ino),
+			inode_manager.get_inode_lock_idx(target_entry.ino),
+			thread_log_fd,
+			"myfs_rename:target_inode:read"
+		);
 
 		err = inode_manager.get_inode(target_entry.ino, target_inode);
 
@@ -1405,6 +1513,8 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 
 			return err;
 		}
+
+		same_source_target = source_inode.get_ino() == target_inode.get_ino();
 
 		// Check for sticky behavior on the target directory
 		if (target_parent_inode.is_dir_sticky()) {
@@ -1464,7 +1574,7 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 	}
 
 	// If rename cross-directory, user must own the source directory (in case of directory)
-	if (source_inode.is_dir() && source_parent_inode.get_ino() != target_parent_inode.get_ino()) {
+	if (source_inode.is_dir() && !same_parent) {
 		if (
 			!is_context_user_root() &&					// user is not the root user
 			!source_inode.user_is_owner()				// user does not own the source item
@@ -1474,6 +1584,49 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 
 			return -EACCES;
 		}
+	}
+
+	// Unlock all read locks
+	source_parent_lock.unlock();
+	target_parent_lock.unlock();
+	source_lock.unlock();
+	if (target_already_exist) target_lock.unlock();
+
+	// Obtain write locks
+	Utilities::Mutex::TrackedUniqueLock source_parent_wr_lock(
+		inode_manager.get_inode_lock(source_parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(source_parent_inode.get_ino()),
+		thread_log_fd,
+		"myfs_rename:source_parent:write"
+	);
+
+	Utilities::Mutex::TrackedUniqueLock target_parent_wr_lock;
+
+	if (!same_parent) {
+		target_parent_wr_lock = Utilities::Mutex::TrackedUniqueLock(
+			inode_manager.get_inode_lock(target_parent_inode.get_ino()),
+			inode_manager.get_inode_lock_idx(target_parent_inode.get_ino()),
+			thread_log_fd,
+			"myfs_rename:target_parent:write"
+		);
+	};
+
+	Utilities::Mutex::TrackedUniqueLock source_inode_wr_lock(
+		inode_manager.get_inode_lock(source_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(source_inode.get_ino()),
+		thread_log_fd,
+		"myfs_rename:source_inode:write"
+	);
+
+	Utilities::Mutex::TrackedUniqueLock target_inode_wr_lock;
+
+	if (target_already_exist && !same_source_target) {
+		target_inode_wr_lock = Utilities::Mutex::TrackedUniqueLock(
+			inode_manager.get_inode_lock(target_inode.get_ino()),
+			inode_manager.get_inode_lock_idx(target_inode.get_ino()),
+			thread_log_fd,
+			"myfs_rename:target_inode:write"
+		);
 	}
 
 	// All checks are good, perform rename
@@ -1575,7 +1728,32 @@ static int myfs_rmdir(const char* path) {
 
 	Inode dir_inode, parent_inode;
 
-	error_t err = inode_manager.get_inode_from_path(path, ROOT_INO, dir_inode);
+	error_t err = inode_manager.get_inode_from_path(dir, ROOT_INO, parent_inode);
+
+	if (err < 0) {
+		Utilities::free_path_split(&ps);
+
+		return err;
+	}
+
+	// Acquire write lock on parent
+	Utilities::Mutex::TrackedUniqueLock parent_write_lock(
+		inode_manager.get_inode_lock(parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(parent_inode.get_ino()),
+		thread_log_fd,
+		"myfs_rmdir:parent_inode:write"
+	);
+
+	// Check if user has permission on parent dir to remove (write permission)
+	if (!parent_inode.can_write()) {
+		Utilities::free_path_split(&ps);
+
+		return -EACCES;
+	}
+
+	dirent_t entry = { 0 };
+
+	err = dirent_manager.dir_find(parent_inode.get_ino(), base, &entry);
 
 	if (err < 0) {
 		Utilities::free_path_split(&ps);
@@ -1584,7 +1762,20 @@ static int myfs_rmdir(const char* path) {
 	}
 
 	// Acquire write lock on dir inode
-	WR_LOCK(get_lock_for_inode(dir_inode.get_ino()));
+	Utilities::Mutex::TrackedUniqueLock dir_inode_lock(
+		inode_manager.get_inode_lock(entry.ino),
+		inode_manager.get_inode_lock_idx(entry.ino),
+		thread_log_fd,
+		"myfs_rmdir:dir_inode:write"
+	);
+
+	err = inode_manager.get_inode(entry.ino, dir_inode);
+
+	if (err < 0) {
+		Utilities::free_path_split(&ps);
+
+		return err;
+	}
 
 	// Check if this is a directory
 	if (!dir_inode.is_dir()) {
@@ -1599,24 +1790,6 @@ static int myfs_rmdir(const char* path) {
 		Utilities::free_path_split(&ps);
 
 		return -ENOTEMPTY;
-	}
-
-	err = inode_manager.get_inode_from_path(dir, ROOT_INO, parent_inode);
-
-	if (err < 0) {
-		Utilities::free_path_split(&ps);
-
-		return err;
-	}
-
-	// Acquire write lock on parent
-	WR_LOCK(get_lock_for_inode(parent_inode.get_ino()));
-
-	// Check if user has permission on parent dir to remove (write permission)
-	if (!parent_inode.can_write()) {
-		Utilities::free_path_split(&ps);
-
-		return -EACCES;
 	}
 
 	// For sticky behavior on parent dir
@@ -1656,11 +1829,15 @@ static int myfs_rmdir(const char* path) {
 	}
 
 	// release dir inode back to the system
+	DBG("ino %ld is released", dir_inode.get_ino());
+
 	err = dir_inode.release();
 
 	if (err < 0) {
 		return err;
 	}
+
+	storage.storage_fsync();
 
 	return 0;
 }
@@ -1680,7 +1857,12 @@ static int myfs_releasedir(const char* path, struct fuse_file_info *fi) {
 	Inode* dir_inode = fh->inode;
 
 	// Acquire write lock on dir inode
-	WR_LOCK(get_lock_for_inode(dir_inode->get_ino()));
+	Utilities::Mutex::TrackedUniqueLock dir_inode_lock(
+		inode_manager.get_inode_lock(dir_inode->get_ino()),
+		inode_manager.get_inode_lock_idx(dir_inode->get_ino()),
+		thread_log_fd,
+		"myfs_releasedir:dir_inode"
+	);
 
 	assert(dir_inode->inode.open_count > 0);
 
@@ -1701,21 +1883,8 @@ static int myfs_releasedir(const char* path, struct fuse_file_info *fi) {
 	return 0;
 }
 
-static int myfs_unlink(const char* path) {
+static int myfs_unlink(const char* path) {	
 	Inode finode, parent_inode;
-
-	error_t err = inode_manager.get_inode_from_path(path, ROOT_INO, finode);
-
-	if (err < 0) {
-		return err;
-	}
-
-	// Acquire write lock on finode
-	WR_LOCK(get_lock_for_inode(finode.get_ino()));
-
-	// Check if this is a directory
-	// unlink on directory is not permitted
-	if (finode.is_dir()) return -EPERM;
 
 	Utilities::path_split ps = { 0 };
 
@@ -1724,7 +1893,7 @@ static int myfs_unlink(const char* path) {
 	char* base = ps.base;
 	char* dir = ps.dir;
 
-	err = inode_manager.get_inode_from_path(dir, ROOT_INO, parent_inode);
+	error_t err = inode_manager.get_inode_from_path(dir, ROOT_INO, parent_inode);
 
 	if (err < 0) {
 		Utilities::free_path_split(&ps);
@@ -1732,8 +1901,41 @@ static int myfs_unlink(const char* path) {
 		return err;
 	}
 
-	// Acquire write lock on parent
-	WR_LOCK(get_lock_for_inode(parent_inode.get_ino()));
+	// Acquire read lock on parent
+	Utilities::Mutex::TrackedSharedLock parent_read_lock(
+		inode_manager.get_inode_lock(parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(parent_inode.get_ino()),
+		thread_log_fd,
+		"myfs_unlink:parent_inode:read"
+	);
+
+	DBG("path: %s", base);
+
+	if (!parent_inode.is_valid()) return -ENOENT;
+
+	dirent_t entry = { 0 };
+
+	err = dirent_manager.dir_find(parent_inode.get_ino(), base, &entry);
+
+	if (err < 0) return err;
+
+	// Acquire read lock on finode
+	Utilities::Mutex::TrackedSharedLock finode_read_lock(
+		inode_manager.get_inode_lock(entry.ino),
+		inode_manager.get_inode_lock_idx(entry.ino),
+		thread_log_fd,
+		"myfs_unlink:finode:read"
+	);
+
+	err = inode_manager.get_inode(entry.ino, finode);
+
+	if (err < 0) return err;
+
+	if (!finode.is_valid()) return -ENOENT;
+
+	// Check if this is a directory
+	// unlink on directory is not permitted
+	if (finode.is_dir()) return -EPERM;
 
 	// Check if user has permission to unlink (write)
 	if (!parent_inode.can_write()) {
@@ -1754,6 +1956,18 @@ static int myfs_unlink(const char* path) {
 		}
 	}
 
+	parent_read_lock.unlock();
+
+	finode_read_lock.unlock();
+
+	// Acquire write lock on parent
+	Utilities::Mutex::TrackedUniqueLock parent_write_lock(
+		inode_manager.get_inode_lock(parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(parent_inode.get_ino()),
+		thread_log_fd,
+		"myfs_unlink:parent_inode:write"
+	);
+
 	// Remove file entry from parent dir
 	err = dirent_manager.dir_remove(parent_inode, base);
 
@@ -1765,10 +1979,18 @@ static int myfs_unlink(const char* path) {
 
 	Utilities::free_path_split(&ps);
 
-	// Update nlink of finode
-	assert(finode.inode.nlink > 0);
+	Utilities::Mutex::TrackedUniqueLock inode_write_lock(
+		inode_manager.get_inode_lock(finode.get_ino()),
+		inode_manager.get_inode_lock_idx(finode.get_ino()),
+		thread_log_fd,
+		"myfs_unlink:finode:write"
+	);
 
-	finode.inode.nlink--;
+	// Update nlink of finode
+	if (finode.inode.nlink > 0) {
+		// Other thread may decrease nlink already
+		finode.inode.nlink--;
+	}
 
 	err = finode.save();
 
@@ -1778,12 +2000,16 @@ static int myfs_unlink(const char* path) {
 
 	// Check if the file inode should be released
 	if (finode.should_file_be_deleted()) {
+		DBG("ino %ld is released", finode.get_ino());
+
 		err = finode.release();
 
 		if (err < 0) {
 			return err;
 		}
 	}
+
+	storage.storage_fsync();
 	
 	return 0;
 }
@@ -1816,8 +2042,13 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 
 	assert(finode != nullptr);
 
-	// Acquire read lock on finode
-	RD_LOCK(get_lock_for_inode(finode->get_ino()));
+	// Acquire write lock on finode
+	Utilities::Mutex::TrackedUniqueLock finode_lock(
+		inode_manager.get_inode_lock(finode->get_ino()),
+		inode_manager.get_inode_lock_idx(finode->get_ino()),
+		thread_log_fd,
+		"myfs_truncate:finode"
+	);
 
 	// Check if inode is a directory
 	if (finode->is_dir()) {
@@ -1879,6 +2110,8 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		return err;
 	}
 
+	storage.storage_fsync();
+
 	return 0;
 }
 
@@ -1907,7 +2140,12 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 	}
 	
 	// Acquire write lock on finode
-	WR_LOCK(get_lock_for_inode(finode->get_ino()));
+	Utilities::Mutex::TrackedUniqueLock finode_lock(
+		inode_manager.get_inode_lock(finode->get_ino()),
+		inode_manager.get_inode_lock_idx(finode->get_ino()),
+		thread_log_fd,
+		"myfs_utimens:finode"
+	);
 
 	bool can_write = false;
 	bool owner_or_root = finode->user_is_owner() || is_context_user_root();
@@ -1986,6 +2224,8 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 		return err;
 	}
 
+	storage.storage_fsync();
+
 	return 0;
 }
 
@@ -2004,7 +2244,12 @@ static int myfs_release(const char* path, struct fuse_file_info *fi) {
 	Inode* inode = fh->inode;
 
 	// Acquire write lock on dir inode
-	WR_LOCK(get_lock_for_inode(inode->get_ino()));
+	Utilities::Mutex::TrackedUniqueLock inode_lock(
+		inode_manager.get_inode_lock(inode->get_ino()),
+		inode_manager.get_inode_lock_idx(inode->get_ino()),
+		thread_log_fd,
+		"myfs_release:inode"
+	);
 
 	assert(inode->inode.open_count > 0);
 
@@ -2057,6 +2302,14 @@ static int myfs_symlink(const char* target, const char* link) {
 		return err;
 	}
 
+	// Acquire write lock
+	Utilities::Mutex::TrackedUniqueLock inode_lock(
+		inode_manager.get_inode_lock(link_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(link_inode.get_ino()),
+		thread_log_fd,
+		"myfs_symlink:inode"
+	);
+
 	DBG("Writing file path of target: %s", target);
 
 	// Write path to symlink
@@ -2072,6 +2325,8 @@ static int myfs_symlink(const char* target, const char* link) {
 		return err;
 	}
 
+	storage.storage_fsync();
+
 	DBG("Done.");
 
 	return 0;
@@ -2085,17 +2340,24 @@ static int myfs_link(const char* target, const char* link) {
 	char* base = link_ps.base;
 	char* dir = link_ps.dir;
 
+	DBG("%s", base);
+
 	Inode parent_inode, target_inode;
-	
+
 	error_t err = inode_manager.get_inode_from_path(dir, ROOT_INO, parent_inode);
+
+	Utilities::Mutex::TrackedUniqueLock parent_lock(
+		inode_manager.get_inode_lock(parent_inode.get_ino()),
+		inode_manager.get_inode_lock_idx(parent_inode.get_ino()),
+		thread_log_fd,
+		"myfs_link:parent_inode:write"
+	);
 
 	if (err < 0) {
 		Utilities::free_path_split(&link_ps);
 
 		return err;
 	}
-
-	WR_LOCK(get_lock_for_inode(parent_inode.get_ino()));
 
 	if (!parent_inode.is_valid()) {
 		Utilities::free_path_split(&link_ps);
@@ -2105,11 +2367,13 @@ static int myfs_link(const char* target, const char* link) {
 
 	if (!parent_inode.can_write()) {
 		Utilities::free_path_split(&link_ps);
-		
+
 		return -EACCES;
 	}
 
-	err = inode_manager.get_inode_from_path(target, ROOT_INO, target_inode);
+	dirent_t entry = { 0 };
+
+	err = dirent_manager.dir_find(parent_inode.get_ino(), base, &entry);
 
 	if (err < 0) {
 		Utilities::free_path_split(&link_ps);
@@ -2117,7 +2381,20 @@ static int myfs_link(const char* target, const char* link) {
 		return err;
 	}
 
-	WR_LOCK(get_lock_for_inode(target_inode.get_ino()));
+	Utilities::Mutex::TrackedUniqueLock target_inode_wr_lock(
+		inode_manager.get_inode_lock(entry.ino),
+		inode_manager.get_inode_lock_idx(entry.ino),
+		thread_log_fd,
+		"myfs_link:target_inode:write"
+	);	
+
+	err = inode_manager.get_inode(entry.ino, target_inode);
+
+	if (err < 0) {
+		Utilities::free_path_split(&link_ps);
+
+		return err;
+	}
 
 	err = dirent_manager.dir_add(parent_inode, target_inode.get_ino(), base);
 
@@ -2138,6 +2415,8 @@ static int myfs_link(const char* target, const char* link) {
 		return err;
 	}
 
+	storage.storage_fsync();
+
 	Utilities::free_path_split(&link_ps);
 
 	return 0;
@@ -2146,13 +2425,15 @@ static int myfs_link(const char* target, const char* link) {
 static int myfs_readlink(const char* link, char* buffer, size_t len) {
 	Inode link_inode;
 
-	error_t err = inode_manager.get_inode_from_path(link, ROOT_INO, link_inode);
+	Utilities::Mutex::TrackedSharedLock link_inode_lock;
+
+	error_t err = inode_manager.get_inode_from_path_locked(link, ROOT_INO, link_inode, link_inode_lock);
+
+	link_inode_lock.change_op("myfs_readlink:link_inode:read");
 
 	if (err < 0) {
 		return err;
 	}
-
-	RD_LOCK(get_lock_for_inode(link_inode.get_ino()));
 
 	if (!S_ISLNK(link_inode.inode.mode)) {
 		return -EINVAL;
@@ -2191,13 +2472,15 @@ static int myfs_access(const char* path, int mode) {
 
 	Inode finode;
 
-	error_t err = inode_manager.get_inode_from_path(path, ROOT_INO, finode);
+	Utilities::Mutex::TrackedSharedLock finode_lock;
+
+	error_t err = inode_manager.get_inode_from_path_locked(path, ROOT_INO, finode, finode_lock);
+
+	finode_lock.change_op("myfs_access:finode");
 
 	if (err < 0) {
 		return err;
 	}
-
-	RD_LOCK(get_lock_for_inode(finode.get_ino()));
 
 	if (!finode.is_valid()) {
 		return -ENOENT;
@@ -2228,11 +2511,13 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 
 	Inode finode;
 
-	error_t err = inode_manager.get_inode_from_path(path, ROOT_INO, finode);
+	Utilities::Mutex::TrackedSharedLock finode_read_lock;
+
+	error_t err = inode_manager.get_inode_from_path_locked(path, ROOT_INO, finode, finode_read_lock);
+
+	finode_read_lock.change_op("myfs_chmod:finode:read");
 
 	if (err < 0) return err;
-
-	WR_LOCK(get_lock_for_inode(finode.get_ino()));
 
 	// chmod if:
 	// - user is the owner of the file
@@ -2298,6 +2583,15 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 
 	DBG("req_perm is: %05o", req_perm);
 
+	finode_read_lock.unlock();
+
+	Utilities::Mutex::TrackedUniqueLock finode_lock(
+		inode_manager.get_inode_lock(finode.get_ino()),
+		inode_manager.get_inode_lock_idx(finode.get_ino()),
+		thread_log_fd,
+		"myfs_chmod:finode:write"
+	);
+
 	// Can change mode
 	// Keep type bits, change permission bits
 	finode.inode.mode = (finode.inode.mode & S_IFMT) | req_perm;
@@ -2309,6 +2603,8 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 	if (err < 0) {
 		return err;
 	}
+	
+	storage.storage_fsync();
 
 	DBG("Done");
 
@@ -2318,11 +2614,22 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info *fi) {
 	Inode finode;
 
-	error_t err = inode_manager.get_inode_from_path(path, ROOT_INO, finode);
+	Utilities::Mutex::TrackedSharedLock finode_read_lock;
+
+	error_t err = inode_manager.get_inode_from_path_locked(path, ROOT_INO, finode, finode_read_lock);
+
+	finode_read_lock.change_op("myfs_chown:finode:read");
 
 	if (err < 0) return err;
 
-	WR_LOCK(get_lock_for_inode(finode.get_ino()));
+	finode_read_lock.unlock();
+
+	Utilities::Mutex::TrackedUniqueLock finode_lock(
+		inode_manager.get_inode_lock(finode.get_ino()),
+		inode_manager.get_inode_lock_idx(finode.get_ino()),
+		thread_log_fd,
+		"myfs_chown:finode:write"
+	);
 
 	pid_t pid = get_context_pid();
 	gid_t user_primary_gid = get_context_gid();
@@ -2377,6 +2684,8 @@ static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_i
 	err = finode.save();
 
 	if (err < 0) return err;
+
+	storage.storage_fsync();
 
 	return 0;
 }

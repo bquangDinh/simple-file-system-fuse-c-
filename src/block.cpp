@@ -48,7 +48,7 @@ error_t StorageManager::init(const char* diskfile_path) {
 }
 
 error_t StorageManager::storage_fsync() {
-    DBG("Syncing storagage...");
+    DBG("Syncing storage...");
 
     assert(is_opened());
 
@@ -113,3 +113,38 @@ error_t StorageManager::block_write(const blk_t block_num, const void* buf) {
 }
 
 
+error_t StorageManager::block_read_not_locked(const blk_t block_num, void* buf) {
+    DBG("Reading from block: %u", block_num);
+
+    assert(is_opened());
+    assert(block_num >= 0 && block_num < NUM_BLK);
+
+    ssize_t bytes_read = pread(_diskfile_fd, buf, BLOCK_SIZE, block_num * BLOCK_SIZE);
+
+    if (bytes_read < 0) {
+        DBG("Failed to read block - bytes read: %zd", bytes_read);
+        return -errno;
+    }
+
+    DBG("Done. Bytes read: %zd", bytes_read);
+
+    return bytes_read;
+}
+
+error_t StorageManager::block_write_not_locked(const blk_t block_num, const void* buf) {
+    DBG("Writing into block: %u", block_num);
+    
+    assert(is_opened());
+    assert(block_num >= 0 && block_num < NUM_BLK);
+
+    ssize_t bytes_written = pwrite(_diskfile_fd, buf, BLOCK_SIZE, block_num * BLOCK_SIZE);
+
+    if (bytes_written < 0) {
+        DBG("Failed to write block - bytes written: %zd", bytes_written);
+        return -errno;
+    }
+
+    DBG("Done. Bytes written: %zd", bytes_written);
+
+    return bytes_written;
+}

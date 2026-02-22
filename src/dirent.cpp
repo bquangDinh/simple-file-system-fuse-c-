@@ -17,6 +17,10 @@ error_t DirentManager::dir_find(ino_t ino, const char* fname, dirent_t* out) {
     assert(ino < superblock.get_max_inum());
     assert(fname != nullptr);
 
+    assert(Utilities::Mutex::DebugLockTracker::is_held(ino % inode_manager.NUM_INODE_LOCKS));
+
+    std::shared_lock<std::shared_mutex> lock(dir_lock);
+
     size_t name_len = strlen(fname);
 
     if (name_len > NAME_MAX) return -ENAMETOOLONG;
@@ -96,6 +100,9 @@ error_t DirentManager::dir_add(Inode& parent, ino_t child_ino, const char* fname
     else if (err < 0 && err != -ENOENT) return err;
 
     DBG("Child ino not yet exist. Good to add");
+
+    // ONLY LOCK AFTER DIR FIND SINCE DIR FIND WOULD HOLD THE LOCK -> DEADLOCK
+    std::unique_lock<std::shared_mutex> lock(dir_lock);
 
     // -ENAMETOOLONG is already reported in dir_find()
     //  so in here, we can assume the name is good
@@ -224,6 +231,8 @@ error_t DirentManager::dir_add(Inode& parent, ino_t child_ino, const char* fname
 error_t DirentManager::dir_remove(Inode& parent, const char* fname) {
     DBG("parent ino: %ld | fname: %s", parent.get_ino(), fname);
 
+    std::unique_lock<std::shared_mutex> lock(dir_lock);
+
     StorageManager& storage = StorageManager::instance();
 
     assert(fname != nullptr);
@@ -297,6 +306,8 @@ int DirentManager::dir_entries_count(Inode& dir) {
 
     StorageManager& storage = StorageManager::instance();
 
+    std::shared_lock<std::shared_mutex> lock(dir_lock);
+
     dirent_t* buffer = (dirent_t*)malloc(storage.BLOCK_SIZE);
 
     if (buffer == nullptr) return -ENOMEM;
@@ -338,6 +349,8 @@ int DirentManager::dir_entries_count(inode_t dir) {
     DBG("dir ino: %ld", dir.ino);
 
     StorageManager& storage = StorageManager::instance();
+
+    std::shared_lock<std::shared_mutex> lock(dir_lock);
 
     dirent_t* buffer = (dirent_t*)malloc(storage.BLOCK_SIZE);
 
@@ -381,6 +394,8 @@ error_t DirentManager::dir_update_dotdot(Inode& dir_inode, Inode& new_parent) {
 
     StorageManager& storage = StorageManager::instance();
     InodeManager& inode_manager = InodeManager::instance();
+
+    std::unique_lock<std::shared_mutex> lock(dir_lock);
 
     dirent_t* buffer = (dirent_t*)malloc(storage.BLOCK_SIZE);
 

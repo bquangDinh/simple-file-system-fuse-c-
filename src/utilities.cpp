@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <cstdlib>
 
+thread_local std::unordered_set<size_t> held_lock_idx;
+
 void Utilities::print_hex(const char* str, size_t len) {
 	for (size_t i = 0; i < len; ++i) {
 		printf("%02x", str[i]);
@@ -28,7 +30,7 @@ void Utilities::print_bitmap_bits(bitmap_t bitmap, size_t bits) {
 }
 
 void Utilities::debug(const char* file, int line, const char* func, const char* fmt, ...) {
-    std::printf("[%s:%d:%s] ", file, line, func);
+    std::printf("[%lu][%s:%d:%s] ", (unsigned long)pthread_self(), file, line, func);
 
     va_list args;
     va_start(args, fmt);
@@ -36,6 +38,8 @@ void Utilities::debug(const char* file, int line, const char* func, const char* 
     va_end(args);
 
     std::printf("\n");
+
+	std::fflush(stdout);
 }
 
 struct timespec Utilities::now(void) {
@@ -195,4 +199,210 @@ bool Utilities::ProcessOps::gid_belongs_to_user_group(pid_t pid, gid_t primary, 
 
 	// Check if target belongs to the user's group
 	return Utilities::ProcessOps::pid_has_group(pid, target);
+}
+
+Utilities::Mutex::TrackedUniqueLock::TrackedUniqueLock(std::shared_mutex& mtx, size_t idx, bool defer)
+: _idx(idx), _defer(defer)
+{
+	if (_defer) {
+		_lock = std::unique_lock<std::shared_mutex>(mtx, std::defer_lock);
+	} else {
+		_lock = std::unique_lock<std::shared_mutex>(mtx);
+		Utilities::Mutex::DebugLockTracker::on_lock(idx);
+	}
+}
+
+Utilities::Mutex::TrackedUniqueLock::TrackedUniqueLock(std::shared_mutex& mtx, size_t idx, FILE* log, const char* op, bool defer)
+: _idx(idx), _defer(defer), _log(log), _op(op)
+{
+	if (_defer) {
+		_lock = std::unique_lock<std::shared_mutex>(mtx, std::defer_lock);
+	} else {
+		if (_log != nullptr && op != nullptr) {
+			fprintf(_log, "[%lu] [%s] TRY ACQUIRING [%s] WR LOCK on idx: %zu\n", (unsigned long)pthread_self(), op, _defer ? "NOT LOCKED" : "LOCKED", idx);
+			fflush(_log);
+		}
+
+		_lock = std::unique_lock<std::shared_mutex>(mtx);
+		Utilities::Mutex::DebugLockTracker::on_lock(idx);
+
+		if (_log != nullptr && op != nullptr) {
+			fprintf(_log, "[%lu] [%s] ACQUIRED [%s] WR LOCK on idx: %zu\n", (unsigned long)pthread_self(), op, _defer ? "NOT LOCKED" : "LOCKED", idx);
+			fflush(_log);
+		}
+	}
+}
+
+Utilities::Mutex::TrackedUniqueLock::TrackedUniqueLock(Utilities::Mutex::TrackedUniqueLock&& other) noexcept
+: _idx(other._idx), _defer(other._defer), _log(other._log), _op(other._op), _lock(std::move(other._lock))
+{
+}
+
+Utilities::Mutex::TrackedUniqueLock& Utilities::Mutex::TrackedUniqueLock::operator=(Utilities::Mutex::TrackedUniqueLock&& other) noexcept {
+	if (this == &other) return *this;
+
+	unlock();
+
+	_lock = std::move(other._lock);
+	_idx = other._idx;
+	_defer = other._defer;
+	_log = other._log;
+	_op = other._op;
+
+	other._idx = 0;
+	other._log = nullptr;
+	other._op = nullptr;
+
+	return *this;
+}
+
+Utilities::Mutex::TrackedUniqueLock::~TrackedUniqueLock() {
+	unlock();
+}
+
+void Utilities::Mutex::TrackedUniqueLock::lock() {
+	assert(_defer);
+
+	if (_log != nullptr && _op != nullptr) {
+		fprintf(_log, "[%lu] [%s] TRY ACQUIRING [%s] WR LOCK on idx: %zu\n", (unsigned long)pthread_self(), _op, _defer ? "NOT LOCKED" : "LOCKED", _idx);
+		fflush(_log);
+	}
+
+	_lock.lock();
+	Utilities::Mutex::DebugLockTracker::on_lock(_idx);
+
+	if (_log != nullptr && _op != nullptr) {
+		fprintf(_log, "[%lu] [%s] ACQUIRED [%s] WR LOCK on idx: %zu\n", (unsigned long)pthread_self(), _op, _defer ? "NOT LOCKED" : "LOCKED", _idx);
+		fflush(_log);
+	}
+}
+
+void Utilities::Mutex::TrackedUniqueLock::unlock() {
+	if (_log != nullptr && _op != nullptr) {
+		fprintf(_log, "[%lu] [%s] TRY RELEASING WR LOCK on idx %zu\n", (unsigned long)pthread_self(), _op, _idx);
+		fflush(_log);
+	}
+
+	if (_lock.owns_lock()) {
+		DebugLockTracker::on_unlock(_idx);
+
+		_lock.unlock();
+
+		if (_log != nullptr && _op != nullptr) {
+			fprintf(_log, "[%lu] [%s] RELEASED WR LOCK on idx %zu\n", (unsigned long)pthread_self(), _op, _idx);
+			fflush(_log);
+		}
+	}
+}
+
+bool Utilities::Mutex::TrackedUniqueLock::owns_lock() {
+	return _lock.owns_lock();
+}
+
+/** */
+
+Utilities::Mutex::TrackedSharedLock::TrackedSharedLock(std::shared_mutex& mtx, size_t idx, bool defer)
+: _idx(idx), _defer(defer)
+{
+	if (_defer) {
+		_lock = std::shared_lock<std::shared_mutex>(mtx, std::defer_lock);
+	} else {
+		_lock = std::shared_lock<std::shared_mutex>(mtx);
+		Utilities::Mutex::DebugLockTracker::on_lock(idx);
+	}
+}
+
+Utilities::Mutex::TrackedSharedLock::TrackedSharedLock(std::shared_mutex& mtx, size_t idx, FILE* log, const char* op, bool defer)
+: _idx(idx), _defer(defer), _log(log), _op(op)
+{
+	if (_defer) {
+		_lock = std::shared_lock<std::shared_mutex>(mtx, std::defer_lock);
+	} else {
+		if (_log != nullptr && op != nullptr) {
+			fprintf(_log, "[%lu] [%s] TRY ACQUIRING [%s] RD LOCK on idx: %zu\n", (unsigned long)pthread_self(), op, _defer ? "NOT LOCKED" : "LOCKED", idx);
+			fflush(_log);
+		}
+
+		_lock = std::shared_lock<std::shared_mutex>(mtx);
+		Utilities::Mutex::DebugLockTracker::on_lock(idx);
+
+		if (_log != nullptr && op != nullptr) {
+			fprintf(_log, "[%lu] [%s] ACQUIRED [%s] RD LOCK on idx: %zu\n", (unsigned long)pthread_self(), op, _defer ? "NOT LOCKED" : "LOCKED", idx);
+			fflush(_log);
+		}
+	}
+}
+
+Utilities::Mutex::TrackedSharedLock::TrackedSharedLock(Utilities::Mutex::TrackedSharedLock&& other) noexcept
+: _idx(other._idx), _defer(other._defer), _log(other._log), _op(other._op), _lock(std::move(other._lock))
+{
+}
+
+Utilities::Mutex::TrackedSharedLock& Utilities::Mutex::TrackedSharedLock::operator=(Utilities::Mutex::TrackedSharedLock&& other) noexcept {
+	if (this == &other) return *this;
+
+	unlock();
+
+	_lock = std::move(other._lock);
+	_idx = other._idx;
+	_defer = other._defer;
+	_log = other._log;
+	_op = other._op;
+
+	if (_lock.owns_lock()) {
+		Utilities::Mutex::DebugLockTracker::on_lock(_idx);
+	}
+
+	other._idx = 0;
+	other._log = nullptr;
+	other._op = nullptr;
+
+	return *this;
+}
+
+Utilities::Mutex::TrackedSharedLock::~TrackedSharedLock() {
+	unlock();
+}
+
+void Utilities::Mutex::TrackedSharedLock::lock() {
+	assert(_defer);
+
+	if (_log != nullptr && _op != nullptr) {
+		fprintf(_log, "[%lu] [%s] TRY ACQUIRING [%s] RD LOCK on idx: %zu\n", (unsigned long)pthread_self(), _op, _defer ? "NOT LOCKED" : "LOCKED", _idx);
+		fflush(_log);
+	}
+
+	_lock.lock();
+	Utilities::Mutex::DebugLockTracker::on_lock(_idx);
+
+	if (_log != nullptr && _op != nullptr) {
+		fprintf(_log, "[%lu] [%s] ACQUIRED [%s] RD LOCK on idx: %zu\n", (unsigned long)pthread_self(), _op, _defer ? "NOT LOCKED" : "LOCKED", _idx);
+		fflush(_log);
+	}
+}
+
+void Utilities::Mutex::TrackedSharedLock::unlock() {
+	if (_log != nullptr && _op != nullptr) {
+		fprintf(_log, "[%lu] [%s] TRY RELEASING RD LOCK on idx %zu\n", (unsigned long)pthread_self(), _op, _idx);
+		fflush(_log);
+	}
+
+	if (_lock.owns_lock()) {
+		DebugLockTracker::on_unlock(_idx);
+
+		_lock.unlock();
+
+		if (_log != nullptr && _op != nullptr) {
+			fprintf(_log, "[%lu] [%s] RELEASED RD LOCK on idx %zu\n", (unsigned long)pthread_self(), _op, _idx);
+			fflush(_log);
+		}
+	}
+}
+
+bool Utilities::Mutex::TrackedSharedLock::owns_lock() {
+	return _lock.owns_lock();
+}
+
+void Utilities::Mutex::TrackedSharedLock::change_op(const char* op) {
+	_op = op;
 }
